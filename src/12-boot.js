@@ -7,6 +7,12 @@
   function watchRoute() {
     if (location.pathname === lastPath) return;
     lastPath = location.pathname;
+    // A hold still unclaimed at a route change belongs to a send that never
+    // departed - the only way one survives to here is the retry arming by hand
+    // and the Update press failing - and it must not be claimed by the next
+    // unrelated send. A hold armed inside rewrite is claimed synchronously
+    // within the same XMLHttpRequest.send call and is never visible here.
+    dropHold();
     // Everything a conversation owns is read here rather than at document
     // start, where the pathname is /app and belongs to no conversation at all.
     // The prune is chained rather than fired alongside so it sees the records
@@ -110,10 +116,14 @@
       childList: true,
       subtree: true
     });
-    // Cancel throws the edit away, so the plan goes with it.
+    // Cancel throws the edit away, so the plan goes with it - and so does an
+    // armed but undeparted hold, which no send is coming to claim.
     document.addEventListener('click', function (ev) {
       var target = ev.target;
-      if (target && target.closest && target.closest('gem-button.cancel-button')) discardPlan();
+      if (target && target.closest && target.closest('gem-button.cancel-button')) {
+        discardPlan();
+        dropHold();
+      }
     }, true);
     schedule();
   }

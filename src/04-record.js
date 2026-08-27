@@ -129,9 +129,31 @@
   // never reached the server - a dropped connection, a tab closed mid-flight -
   // deleted the records of turns the server never truncated and left the record
   // for this message claiming a list that was never sent.
-  var heldDrop = null;
-  var heldPath = null;
-  var heldRecord = null;
+  var inflightSend = null;
+  // The snapshots of sends that have departed but not yet settled. Each is
+  // settled only by its own request's outcome, and heldThumbs reads it so a
+  // route-change release cannot revoke a URL a rollback may still write back.
+  var departedSends = [];
+
+  // An abandoned hold still owns the thumb URLs installOverride displaced
+  // without revoking, so discarding the hold has to discharge that duty,
+  // keeping any URL the record still shows.
+  function dropHold() {
+    var snap = inflightSend;
+    inflightSend = null;
+    if (!snap || snap.absent) return;
+    var o = overrideAtPath(snap.index, snap.path);
+    releaseThumbs(snap.thumbs, o ? o.thumbs : null);
+  }
+
+  // Called by the transport hooks at the moment a StreamGenerate departs, so a
+  // send settles its own snapshot and never one armed for a different send.
+  function claimInflightSend() {
+    var snap = inflightSend;
+    inflightSend = null;
+    if (snap) departedSends.push(snap);
+    return snap;
+  }
 
   // The conversation is pinned when the hold is armed rather than read again
   // when the send settles. A send that lands after the user has routed away
@@ -146,64 +168,51 @@
     // that is not its own.
     if (typeof index !== 'number' || index < 0) {
       say('warn', LOG_IMG, 'send held with no message index, records left untouched');
-      heldDrop = null;
-      heldPath = null;
-      heldRecord = null;
+      dropHold();
       // Said out loud, because the caller went on to write a record at that
       // same index and the warning above then described the opposite of what
       // happened. Refusing to hold and refusing to write are one decision.
       return false;
     }
-    heldDrop = index;
-    heldPath = path;
-    heldRecord = snapshotOverride(index);
+    // A hold still sitting unclaimed here was abandoned by a send that never
+    // departed, and its release duty is discharged before it is overwritten.
+    dropHold();
+    inflightSend = snapshotOverride(index, path);
     return true;
   }
 
-  function sendLanded() {
-    var index = heldDrop;
-    var path = heldPath;
-    heldDrop = null;
-    heldPath = null;
-    heldRecord = null;
-    if (index === null) return;
+  function sendLanded(sent) {
+    if (!sent) return;
+    var at = departedSends.indexOf(sent);
+    if (at !== -1) departedSends.splice(at, 1);
     // Against the pinned conversation, wherever the user is by now: the server
     // truncated that one, so its later records describe turns that no longer
     // exist whether or not it is still the conversation on screen.
-    dropRecordsAfter(index, path);
+    dropRecordsAfter(sent.index, sent.path);
+    // The landed send made the pre-send thumbs unreachable, so the snapshot's
+    // URLs are revoked here, keeping any URL the record still shows.
+    if (!sent.absent) {
+      var o = overrideAtPath(sent.index, sent.path);
+      releaseThumbs(sent.thumbs, o ? o.thumbs : null);
+    }
   }
 
-  function sendFailed(why) {
-    if (heldDrop === null) return;
-    var snap = heldRecord;
-    var index = heldDrop;
-    var path = heldPath;
-    heldDrop = null;
-    heldPath = null;
-    heldRecord = null;
-    // The rollback is the half that cannot be done from a pinned path:
-    // restoreOverride finds its record through overrideAt and keys its delete
-    // by the pathname on screen, both of which describe the conversation being
-    // looked at. Rather than write this conversation's record from another
-    // one's snapshot, the hold is resolved and what it cost is named.
-    if (path !== location.pathname) {
-      reportDowngrade('the record for message #' + index + ' is left as the send wrote it '
-        + 'rather than put back',
-        'the send did not go out (' + why + ') and the page moved from ' + path
-        + ' to ' + location.pathname + ' before the rollback could run');
-      return;
-    }
+  function sendFailed(sent, why) {
+    if (!sent) return;
+    var at = departedSends.indexOf(sent);
+    if (at !== -1) departedSends.splice(at, 1);
     say('warn', LOG_IMG, 'the send did not go out (' + why + '); the later records are kept '
       + 'and the record for this message is put back as it was');
-    restoreOverride(snap);
+    restoreOverride(sent);
     schedule();
   }
 
-  function snapshotOverride(index) {
-    var o = overrideAt(index);
-    if (!o) return { index: index, absent: true };
+  function snapshotOverride(index, path) {
+    var o = overrideAtPath(index, path);
+    if (!o) return { index: index, path: path, absent: true };
     return {
       index: index,
+      path: path,
       absent: false,
       thumbs: o.thumbs.slice(),
       attachments: o.attachments,
@@ -213,18 +222,34 @@
 
   function restoreOverride(snap) {
     if (!snap) return;
-    var o = overrideAt(snap.index);
+    var o = overrideAtPath(snap.index, snap.path);
     if (snap.absent) {
-      if (!o) return;
-      dropView(o);
-      releaseThumbs(o.thumbs);
-      overrides.splice(overrides.indexOf(o), 1);
-      dbDelete(RECORDS, [location.pathname + '#' + snap.index]).catch(function (err) {
+      // The row goes whether or not the array still holds a copy of it. The
+      // send wrote the row, and a route change afterwards releases the array
+      // but not the store; keying the delete off the array would leave the row
+      // behind for good, while the failure was already reported as rolled back.
+      // The key is the snapshot's own, so no record is needed to build it.
+      if (o) {
+        dropView(o);
+        releaseThumbs(o.thumbs);
+        overrides.splice(overrides.indexOf(o), 1);
+      }
+      dbDelete(RECORDS, [snap.path + '#' + snap.index]).catch(function (err) {
         say('warn', LOG_IMG, 'could not discard the record of a send that failed:', err);
       });
       return;
     }
-    if (!o) return;
+    // The record can be gone from the array while its row is still in the
+    // store: the send wrote the row through installOverride/persistOverrides,
+    // and a route change afterwards released the array's copy of it. The row is
+    // put back rather than skipped, or the rollback would leave the store
+    // holding a list that was never sent. It is put back in the store alone and
+    // never pushed into the array: the array holds the conversation on screen,
+    // and a record absent from it belongs to one that is not.
+    if (!o) {
+      rollbackStoredRecord(snap);
+      return;
+    }
     releaseThumbs(o.thumbs, snap.thumbs);
     o.thumbs = snap.thumbs;
     o.attachments = snap.attachments;
@@ -234,20 +259,59 @@
     // same send armed passed its guard and went on to overwrite the rollback.
     o.gen = nextGen();
     dropView(o);
-    persistOverrides();
+    persistOverrides(snap.path);
+  }
+
+  // Asked of the store rather than assumed, because a record missing from the
+  // array means one of two opposite things. Either a route change released the
+  // array's copy and the row is still on file, in which case the rollback owes
+  // it the list the send replaced; or a send at an earlier ordinal truncated
+  // this turn away and took the row with it, in which case putting one back
+  // resurrects a record for a turn the server no longer has - which the next
+  // visit then draws over whichever message has taken that ordinal.
+  function rollbackStoredRecord(snap) {
+    dbReadAll(RECORDS).then(function (rows) {
+      var row = null;
+      rows.forEach(function (r) {
+        if (r && r.path === snap.path && r.index === snap.index) row = r;
+      });
+      if (!row) {
+        dbg('restoreOverride: nothing on file at #' + snap.index + ' of ' + snap.path
+          + ', the turn was truncated away, nothing put back');
+        return null;
+      }
+      // Hydrated in the meantime, so the array holds the record again and its
+      // own writer owns the row; a second write of the same key from here would
+      // race it with a list read before that hydration.
+      if (overrideAtPath(snap.index, snap.path)) return null;
+      // Thumbs are stored empty by persistOverrides, and the same holds for a
+      // row written from a snapshot: a blob: URL dies with the document that
+      // minted it, and the bytes beside it are what restores the record.
+      row.thumbs = snap.thumbs.map(function () { return ''; });
+      row.attachments = snap.attachments;
+      row.blobs = snap.blobs;
+      row.savedAt = Date.now();
+      return dbWrite(RECORDS, [row]);
+    }).catch(function (err) {
+      say('warn', LOG_IMG, 'could not put back the record of a send that failed at #'
+        + snap.index + ' of ' + snap.path + ':', err);
+    });
+    // The array does not take these URLs over, and the snapshot left
+    // departedSends before this ran, so nothing else is left to free them.
+    releaseThumbs(snap.thumbs);
   }
 
   // The conversation is passed in, never read off the location: this runs when
   // the send lands, which can be long after the user has routed elsewhere.
   //
   // The store decides which rows go, not the in-memory array. The array holds
-  // one conversation - whichever is on screen - and this runs precisely when
-  // that need not be the one the send belonged to: releaseOffPath will have
-  // emptied it of these very rows, an empty filter reads as "nothing to
-  // discard", and the records of turns the server has just thrown away survive
-  // for good. Nothing else deletes a record row, so there is no later pass to
-  // catch them; they come back on the next visit and are drawn over whichever
-  // messages now occupy those ordinals.
+  // only what this document has written or read back, so a row left by an
+  // earlier document - or by another tab - is in the store and not in the
+  // array, an empty filter over the array reads as "nothing to discard", and
+  // the records of turns the server has just thrown away survive for good.
+  // Nothing else deletes a record row, so there is no later pass to catch them;
+  // they come back on the next visit and are drawn over whichever messages now
+  // occupy those ordinals.
   //
   // The array is still cleaned, because what is on screen has to stop showing
   // the discarded turns, but it is cleaned as a consequence rather than as the
@@ -430,10 +494,12 @@
   }
 
   // A thumbnail replaced is a thumbnail nothing can reach: a blob: URL pins its
-  // bytes until it is revoked, and both the refresh and a second edit of the
-  // same message used to overwrite the list and leave the old URLs behind.
-  // Only what this document minted is revoked - an lh3 URL is not ours - and
-  // anything carried into the new list is left alone.
+  // bytes until it is revoked, and the refresh used to overwrite the list and
+  // leave the old URLs behind. What installOverride displaces is released not
+  // there but when the send settles - sendLanded revokes the snapshot's URLs,
+  // a failure writes them back - so nothing revokes a URL a rollback still
+  // needs. Only what this document minted is revoked - an lh3 URL is not
+  // ours - and anything carried into the new list is left alone.
   function releaseThumbs(old, keep) {
     (old || []).forEach(function (url) {
       if (typeof url !== 'string' || url.indexOf('blob:') !== 0) return;
@@ -447,15 +513,19 @@
     });
   }
 
-  function installOverride(index, thumbs, attachments, blobs) {
+  function installOverride(index, path, thumbs, attachments, blobs) {
     var kept = 0;
     (blobs || []).forEach(function (b) { if (b) kept++; });
     dbg('installOverride: message #' + index + ',', thumbs.length, 'thumbs,', kept,
       'images kept, attachments =', attShape(attachments));
     if (typeof index !== 'number' || index < 0) return false;
-    var existing = overrideAt(index);
+    var existing = overrideAtPath(index, path);
     if (existing) {
-      releaseThumbs(existing.thumbs, thumbs);
+      // The displaced URLs are not revoked here. installOverride's only caller
+      // is commitSend, which armed holdSend for this same (index, path) a
+      // moment earlier, so inflightSend.thumbs holds them - revoking them here
+      // killed the very strings a failed send's rollback writes back. The
+      // release happens when the send settles.
       existing.thumbs = thumbs;
       existing.attachments = attachments;
       existing.blobs = blobs || [];
@@ -469,7 +539,7 @@
       dropView(existing);
     } else {
       overrides.push({
-        path: location.pathname,
+        path: path,
         index: index,
         thumbs: thumbs,
         attachments: attachments,
@@ -478,17 +548,17 @@
         view: null
       });
     }
-    persistOverrides();
+    persistOverrides(path);
     return true;
   }
 
-  function persistOverrides() {
-    // Only this conversation's records are written. The array also holds the
-    // records of conversations this document merely visited before an in-page
-    // navigation, and rewriting those stamped them as freshly used - which is
-    // exactly what §store's least-recently-used eviction reads - and undid
-    // another tab's pruning of the same rows.
-    var mine = overrides.filter(function (o) { return o.path === location.pathname; });
+  function persistOverrides(path) {
+    // Only the passed conversation's records are written. The array also holds
+    // the records of conversations this document merely visited before an
+    // in-page navigation, and rewriting those stamped them as freshly used -
+    // which is exactly what §store's least-recently-used eviction reads - and
+    // undid another tab's pruning of the same rows.
+    var mine = overrides.filter(function (o) { return o.path === path; });
     var records = mine.map(function (o) {
       return {
         key: o.path + '#' + o.index,
@@ -544,26 +614,43 @@
     }
   }
 
-  // The thumbs a held send could still restore, or nothing. Read from the
-  // snapshot rather than the record, because the record is what the send has
-  // already overwritten.
+  // The thumbs a send could still put back, or nothing: answered for the hold
+  // that has not departed yet and for every send that has departed and not yet
+  // settled. Read from the snapshots rather than from the record, because the
+  // record is what the send has already overwritten. This is what makes
+  // releasing the cache safe while a send is in flight, and why sendFailed's
+  // rollback can still write live URLs into the record after the route changed.
   function heldThumbs(o) {
-    if (!heldRecord || heldRecord.absent) return null;
-    if (heldPath !== o.path || heldDrop !== o.index) return null;
-    return heldRecord.thumbs;
+    var kept = null;
+    function take(snap) {
+      if (!snap || snap.absent) return;
+      if (snap.path !== o.path || snap.index !== o.index) return;
+      kept = (kept || []).concat(snap.thumbs);
+    }
+    take(inflightSend);
+    for (var i = 0; i < departedSends.length; i++) take(departedSends[i]);
+    return kept;
   }
 
   // Runs again on every route change, because the pathname it filters on is
   // whatever is on screen at the moment it is called and the landing page is
   // never the conversation. Idempotent per path: a record already in the array
   // is left where it is.
+  //
+  // The store is the durable source of truth for which file backs a slot; the
+  // array is a cache of the conversation on screen. It is released here
+  // synchronously and refilled from the store asynchronously, which is what
+  // guarantees that a returning visit reads the store's current rows - another
+  // tab's writes and its deletions included - instead of a stale resident copy,
+  // and that no record of the conversation being entered is resident during the
+  // first scan pass after the pathname flips.
   function restoreOverrides() {
     releaseOffPath();
     return dbReadAll(RECORDS).then(function (kept) {
       var mine = kept.filter(function (r) { return r && r.path === location.pathname; });
       if (!mine.length) return;
       mine.forEach(function (r) {
-        if (overrideAt(r.index)) return;
+        if (overrideAtPath(r.index, r.path)) return;
         var blobs = Array.isArray(r.blobs) ? r.blobs : [];
         overrides.push({
           path: r.path,
@@ -916,16 +1003,7 @@
   // place, so the object is still the same object after another send has
   // replaced everything in it.
   function refreshOverride(index, attempt, conv, path, gen) {
-    // The ordinal counts messages in one conversation and means nothing in
-    // another. Re-reading it here wrote one turn's tokens into whichever
-    // record happened to sit at the same position in the thread the user had
-    // routed to, and then dropped that record's bytes.
-    if (location.pathname !== path) {
-      reportDowngrade('reference upgrade dropped, later resends of this message stay slow',
-        'the page moved from ' + path + ' to ' + location.pathname + ' before the upgrade ran');
-      return;
-    }
-    var o = overrideAt(index);
+    var o = overrideAtPath(index, path);
     dbg('refreshOverride: fire, message #' + index + ', expect',
       o ? o.attachments.length : 0, 'attachments, attempt', attempt,
       '(record ' + (o ? 'found' : 'MISSING') + ')');
@@ -963,18 +1041,6 @@
         }
         throw new Error('no attachment list matching the record');
       }
-      // By the pinned path, never the live one. overrideAt reads
-      // location.pathname, and the rpc above is long enough for the user to
-      // have routed elsewhere; the ordinal then resolves to whichever record
-      // sits at the same position in the conversation now on screen, and what
-      // follows would write this turn's tokens into it and destroy its bytes.
-      // The entry guard cannot cover this - it runs before the rpc, not after.
-      if (location.pathname !== path) {
-        reportDowngrade('reference upgrade dropped, later resends of this message stay slow',
-          'the page moved from ' + path + ' to ' + location.pathname
-          + ' while the upgrade was in flight');
-        return;
-      }
       var current = overrideAtPath(index, path);
       // The record this upgrade was armed for, or nothing. A second send to
       // the same message rewrote it in place while the rpc was in flight, and
@@ -1007,7 +1073,7 @@
       current.gen = nextGen();
       dbg('refreshOverride: released', (freed / 1048576).toFixed(2) + 'MB of image bytes,',
         'the record now reads from the server references');
-      persistOverrides();
+      persistOverrides(path);
       dropView(current);
       schedule();
       dbg('record upgraded to server references', tuples.length);

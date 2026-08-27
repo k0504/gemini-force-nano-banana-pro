@@ -152,7 +152,7 @@
     // Refusing to hold and refusing to write are one decision: without a hold
     // there is no ordinal this send's outcome can be resolved against, and a
     // record written at that same ordinal is one nothing will ever put back.
-    if (!holdSend(p.index, location.pathname)) return false;
+    if (!holdSend(p.index, p.path)) return false;
 
     // Either applyPlanTo backed out or there was never a list to write, so the
     // only one to hand is the one the page built, which need not be as long as
@@ -176,6 +176,7 @@
 
     var stored = installOverride(
       p.index,
+      p.path,
       p.entries.map(function (entry) { return entry.thumb; }),
       written,
       blobs
@@ -192,11 +193,14 @@
       // may belong to a later send; the generation is the one installOverride
       // has just written, and it is what tells that later send's record from
       // this one when both are the same object.
-      var justStored = overrideAt(p.index);
+      //
+      // The conversation comes from the plan, pinned when the plan was built,
+      // rather than from whatever is on screen at the moment of the send.
+      var justStored = overrideAtPath(p.index, p.path);
       pendingRefresh = {
         index: p.index,
-        path: location.pathname,
-        conv: conversationId(),
+        path: p.path,
+        conv: p.conv,
         gen: justStored ? justStored.gen : 0
       };
     }
@@ -399,7 +403,7 @@
     info('send: ' + parts.join(' | '));
   }
 
-  function traceStream(xhr, w) {
+  function traceStream(xhr, w, sent) {
     var t0 = Date.now();
     var firstByteAt = null;
     var lastByteAt = null;
@@ -423,19 +427,19 @@
       report(w, 'first byte ' + (firstByteAt ? secs(firstByteAt - t0) : 'never')
         + ' | total ' + secs(end - t0));
       // A status the server refused with is not a truncation either.
-      if (serverRefused(xhr)) sendFailed('http ' + xhr.status);
-      else sendLanded();
+      if (serverRefused(xhr)) sendFailed(sent, 'http ' + xhr.status);
+      else sendLanded(sent);
       noteGenerationFinished();
     });
     xhr.addEventListener('error', function () {
       dbg('xhr: StreamGenerate errored after', ((Date.now() - t0) / 1000).toFixed(1) + 's');
       report(w, 'failed after ' + secs(Date.now() - t0));
-      sendFailed('the request errored');
+      sendFailed(sent, 'the request errored');
     });
     xhr.addEventListener('abort', function () {
       dbg('xhr: StreamGenerate aborted after', ((Date.now() - t0) / 1000).toFixed(1) + 's');
       report(w, 'aborted after ' + secs(Date.now() - t0));
-      sendFailed('the request was aborted');
+      sendFailed(sent, 'the request was aborted');
     });
   }
 
@@ -509,7 +513,9 @@
     if (typeof this.__gemUrl === 'string' && this.__gemUrl.indexOf('StreamGenerate') !== -1) {
       dbg('xhr: sending StreamGenerate, body', result.body === body ? 'untouched' : 'rewritten');
       keepBody(this.__gemUrl, result.body, result.body !== body);
-      traceStream(this, takeWork());
+      // This runs after rewrite() above, so a hold armed by commitSend inside it
+      // is claimed by the very request that carries the send.
+      traceStream(this, takeWork(), claimInflightSend());
     }
 
     var xhr = this;
@@ -585,6 +591,7 @@
       // response. Only a send: any other fetch resolving first would settle a
       // hold that belongs to the request still in flight.
       var sent = null;
+      var hold = null;
       var t0 = 0;
       if (result && url.indexOf('StreamGenerate') !== -1) {
         // Everything the XHR branch owes a send it is about to make, minus the
@@ -594,6 +601,9 @@
         // the cost line is the number every §shape decision is measured
         // against, so a migration off XHR must not be what silences it.
         sent = takeWork();
+        // The snapshot leaves the slot with the request that carries it, so the
+        // settle below resolves this send's own hold and no other's.
+        hold = claimInflightSend();
         t0 = Date.now();
         keepBody(url, result.body, touched);
         if (!fetchSendSeen) {
@@ -602,11 +612,11 @@
             + ' cover this transport, timings are per-request only');
         }
         promise = promise.then(function (res) {
-          if (serverRefused(res)) sendFailed('http ' + res.status);
-          else sendLanded();
+          if (serverRefused(res)) sendFailed(hold, 'http ' + res.status);
+          else sendLanded(hold);
           return res;
         }, function (err) {
-          sendFailed('the fetch failed');
+          sendFailed(hold, 'the fetch failed');
           throw err;
         });
       }

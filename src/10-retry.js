@@ -70,6 +70,10 @@
     }, RETRY_STEP_MS, function (btn) {
       if (!btn) {
         retryPending = false;
+        // The no-plan path arms a hold by hand before pressing. No request is
+        // going out now, so that hold is abandoned here rather than left for an
+        // unrelated send to claim.
+        dropHold();
         say('warn', LOG_IMG, 'retry: the Update button never unlocked; press it or cancel');
         return;
       }
@@ -83,9 +87,24 @@
       waitUntil(function () {
         return !host.isConnected || !host.classList.contains('edit-mode') ? true : null;
       }, 2500, function (closed) {
-        if (closed) { retryPending = false; return; }
+        if (closed) {
+          retryPending = false;
+          // Edit mode going away is read as the send having departed, but it is
+          // read off the DOM and edit mode can also go away without a request -
+          // a Cancel that lands between two polls looks exactly like this. A
+          // hold left armed here is claimed by the next unrelated send, which
+          // then truncates records at an ordinal it never touched, so it is
+          // discarded. Discarding it is safe in the other direction: a request
+          // that did depart took the hold with it at the transport hook, so the
+          // slot is already empty and this is then nothing at all.
+          dropHold();
+          return;
+        }
         if (attempt >= 3) {
           retryPending = false;
+          // As above: the presses fired no request, so a hold armed by hand for
+          // this retry is discarded rather than left armed.
+          dropHold();
           say('warn', LOG_IMG, 'retry: Update ignored', attempt, 'presses; press it or cancel');
           return;
         }
