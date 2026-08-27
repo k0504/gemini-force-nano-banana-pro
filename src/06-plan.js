@@ -39,25 +39,22 @@
       armedAt: null,
       sentinelApplied: false
     };
-    // A contrib this document did not mint, or minted too long ago, is a dead
-    // reference: it goes out as-is on an edit that adds no image - deleting one
-    // image, or changing only the text - and the send fails on an upload the
-    // server has already collected. Re-uploading is started here so it is done
-    // by the time Update is pressed, and only for what cannot be vouched for.
-    if (staleContribs(p)) {
-      info(LOG_IMG, 'the record points at uploads this document cannot vouch for, '
-        + 'refreshing them before the resend');
-      freshenExisting(p);
-    }
+    // Unconditionally, and as early as edit mode opens, because §shape can only
+    // take the fast route when every attachment written is a contrib this
+    // document minted - see the timing table there. Which entries actually cost
+    // an upload is freshenExisting's to decide: one that already holds a live
+    // contrib of ours is reused where it stands.
+    //
+    // This was once gated on the base holding a contrib that had gone stale,
+    // which read the case backwards. §refresh upgrades a record's contribs to
+    // the server's own durable references, and a server reference is not a
+    // contrib tuple at all, so the gate saw nothing stale, nothing was
+    // re-uploaded, and applyPlanTo wrote the reference straight back - the
+    // nine-element shape the timing table measures at 79.9s against 24.2s. The
+    // regression therefore arrived on its own, one record upgrade after the
+    // shape work landed, which is what made it read as the fix coming undone.
+    freshenExisting(p);
     return p;
-  }
-
-  function staleContribs(p) {
-    if (!p.base) return false;
-    return p.entries.some(function (entry) {
-      var known = p.base[entry.index];
-      return isContribTuple(known) && !contribIsOurs(known[0][0]);
-    });
   }
 
   function planIsDirty(p) {
@@ -233,14 +230,18 @@
       var known = p.base && p.base[entry.index];
 
       serverName(p, entry).then(function (name) {
-        var bytes = entry.bytes || (p.baseBlobs && p.baseBlobs[entry.index]) || null;
-        if (bytes) return uploadInto(entry, bytes, name, 'uploading from the record,');
-
+        // Ahead of the bytes, not behind them. A live contrib of ours is
+        // already the shape the send wants, so uploading over it buys nothing
+        // and costs a round trip per image on every edit - which is now every
+        // edit, since this runs unconditionally.
         if (isContribTuple(known) && contribIsOurs(known[0][0])) {
           entry.freshAttachment = known;
           dbg('freshen: existing#' + entry.index, 'contrib from this document, reused as-is');
           return null;
         }
+
+        var bytes = entry.bytes || (p.baseBlobs && p.baseBlobs[entry.index]) || null;
+        if (bytes) return uploadInto(entry, bytes, name, 'uploading from the record,');
 
         dbg('freshen: existing#' + entry.index, 'no bytes held, refetching from',
           String(entry.thumb).slice(0, 60));

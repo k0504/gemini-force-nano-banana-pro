@@ -217,6 +217,16 @@
       btn.addEventListener('click', function (ev) {
         ev.preventDefault();
         ev.stopPropagation();
+        // The clone is removed while any message is open for editing, so this
+        // answers only the press that beats the next scan pass to it - and the
+        // press that lands on a clone Angular has kept in a row it rebuilt.
+        // Either way the retry would open edit mode on a message already open
+        // for editing, which throws the edit being made away.
+        if (document.querySelector('div.user-query-container.edit-mode')) {
+          disarm();
+          say('warn', LOG_IMG, 'retry: refused - a message is open for editing');
+          return;
+        }
         var turn = wrap.closest('.conversation-container');
         var host = turn && turn.querySelector('div.user-query-container');
         if (!host) return;

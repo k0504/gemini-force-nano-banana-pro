@@ -29,8 +29,13 @@
       removeRetryButtons();
       return;
     }
-    ensureRetryButtons();
     var host = document.querySelector('div.user-query-container.edit-mode');
+    // Not while a message is open for editing. The retry rewrites the message
+    // it is pressed on, which is what edit mode is already doing by hand, and
+    // the clone sits in the row the page's own controls are in - close enough
+    // to the editor's own toolbar for a stray press to throw the edit away.
+    // The button is put back by the pass that follows the edit closing.
+    if (host) removeRetryButtons(); else ensureRetryButtons();
     if (!host) {
       teardownEditorUi();
       syncOverrides();
