@@ -37,6 +37,11 @@
       // another conversation misses every thumbnail, and a miss is a permanent
       // rename to image-<n>.jpg.
       conv: conversationId(),
+      // And the pathname beside it, because a record is keyed by pathname while
+      // an rpc is asked by conversation id, and the two are not interchangeable.
+      // Anything judging this plan after an await needs to know which thread it
+      // belongs to rather than which one is on screen by then.
+      path: location.pathname,
       base: base,
       baseBlobs: baseBlobs,
       originalCount: thumbs.length,

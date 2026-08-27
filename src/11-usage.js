@@ -42,6 +42,15 @@
   // present - a blank the user cannot tell from a quota the server declines to
   // report. Nothing is written unless at least one window came back with a
   // number in it.
+  // One owner for "is there a number here worth showing". Adoption counted a
+  // window as readable on either field being present while the line that draws
+  // it needs `used` specifically, so a payload carrying only `remaining` was
+  // adopted, stamped as read, and cleared the backoff - and then drew a bare
+  // dash, having already hidden Gemini's own disclaimer to make room for it.
+  function windowIsDrawable(w) {
+    return !!w && typeof w.used === 'number';
+  }
+
   function adoptUsage(payload) {
     var list = Array.isArray(payload) && Array.isArray(payload[1]) ? payload[1] : [];
     var next = {};
@@ -55,7 +64,7 @@
         used: typeof w[1] === 'number' ? w[1] : null,
         resetAt: typeof stamp === 'number' ? stamp * 1000 : null
       };
-      if (win.remaining !== null || win.used !== null) readable++;
+      if (windowIsDrawable(win)) readable++;
       next[w[2]] = win;
     }
     if (!readable) return false;
@@ -193,7 +202,7 @@
   // window that ended.
   function partText(label, kind) {
     var w = usage.windows && usage.windows[kind];
-    if (!w || typeof w.used !== 'number') return label + ' -';
+    if (!windowIsDrawable(w)) return label + ' -';
     if (w.resetAt && Date.now() >= w.resetAt) return label + ' -';
     var text = label + ' ' + (w.used * 100).toFixed(1) + '%';
     if (w.remaining !== null) text += ' · ' + grouped(w.remaining) + ' left';

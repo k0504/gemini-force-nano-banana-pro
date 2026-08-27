@@ -193,6 +193,15 @@
         // No plan to report dirty through, so the sentinel is written by hand;
         // rewrite() strips it with or without a plan.
         writeTextarea(got.textarea, got.textarea.value + SENTINEL);
+        // And the hold by hand with it. Whether the records this resend
+        // discards are dealt with was answered by "does a plan exist", which
+        // the editor decides for its own unrelated reason - a message with no
+        // attachment and no preview container gets no plan at all, so a retry
+        // of one truncated the thread on the server and left every later
+        // record behind for syncOverrides to draw over whichever messages take
+        // those ordinals next. The server truncates on the resend, not on the
+        // toolbar being drawn.
+        holdSend(indexOfHost(host), location.pathname);
         reportRetryLead(t0);
         pressUpdate(host);
       }

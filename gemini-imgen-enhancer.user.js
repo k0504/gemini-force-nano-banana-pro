@@ -6,7 +6,7 @@
 // @license      MIT
 // @homepageURL  https://github.com/k0504/gemini-imgen-enhancer
 // @supportURL   https://github.com/k0504/gemini-imgen-enhancer/issues
-// @version      3.45.0
+// @version      3.46.0
 // @description  Force Gemini image generation onto Nano Banana Pro from the first request, and edit the images attached to an existing prompt.
 // @description:zh-TW  自首次請求即強制以 Nano Banana Pro 生成圖片，並可編輯既有 prompt 附加的圖片。
 // @match        https://gemini.google.com/*
@@ -136,7 +136,7 @@
   var WIZ_KEYS = { pctx: 'Ylro7b', pushId: 'qKIAYe', at: 'SNlM0e', bl: 'cfb2h', sid: 'FdrFJe' };
 
   // §config ==================================================================
-  var VERSION = '3.45.0';
+  var VERSION = '3.46.0';
 
   // Gemini keeps its own Update button disabled until the prompt text differs
   // from what the message already holds, so an image-only change cannot be
@@ -927,29 +927,56 @@
     o.thumbs = snap.thumbs;
     o.attachments = snap.attachments;
     o.blobs = snap.blobs;
+    // A writer like any other. Left unbumped, a record put back after a failed
+    // send still read as the generation that send installed, so an upgrade the
+    // same send armed passed its guard and went on to overwrite the rollback.
+    o.gen = nextGen();
     dropView(o);
     persistOverrides();
   }
 
   // The conversation is passed in, never read off the location: this runs when
-  // the send lands, which can be long after the user has routed elsewhere. The
-  // stored keys are built from the doomed rows themselves, so they were never
-  // wrong; the filter that chose those rows was.
+  // the send lands, which can be long after the user has routed elsewhere.
+  //
+  // The store decides which rows go, not the in-memory array. The array holds
+  // one conversation - whichever is on screen - and this runs precisely when
+  // that need not be the one the send belonged to: releaseOffPath will have
+  // emptied it of these very rows, an empty filter reads as "nothing to
+  // discard", and the records of turns the server has just thrown away survive
+  // for good. Nothing else deletes a record row, so there is no later pass to
+  // catch them; they come back on the next visit and are drawn over whichever
+  // messages now occupy those ordinals.
+  //
+  // The array is still cleaned, because what is on screen has to stop showing
+  // the discarded turns, but it is cleaned as a consequence rather than as the
+  // source of truth.
   function dropRecordsAfter(index, path) {
-    var doomed = overrides.filter(function (o) {
+    overrides.filter(function (o) {
       return o.path === path && o.index > index;
-    });
-    if (!doomed.length) return;
-    doomed.forEach(function (o) {
+    }).forEach(function (o) {
       dropView(o);
       releaseThumbs(o.thumbs);
       overrides.splice(overrides.indexOf(o), 1);
     });
-    var keys = doomed.map(function (o) { return o.path + '#' + o.index; });
-    dbg('dropRecordsAfter: message #' + index + ' of ' + path + ' resent,', keys.length,
-      'later records discarded with it');
-    dbDelete(RECORDS, keys).catch(function (err) {
-      say('warn', LOG_IMG, 'could not discard the records after #' + index + ':', err);
+
+    return dbReadAll(RECORDS).then(function (rows) {
+      var keys = rows.filter(function (r) {
+        return r && r.path === path && r.index > index;
+      }).map(function (r) { return r.path + '#' + r.index; });
+      if (!keys.length) {
+        dbg('dropRecordsAfter: message #' + index + ' of ' + path
+          + ' resent, no later records were on file');
+        return null;
+      }
+      dbg('dropRecordsAfter: message #' + index + ' of ' + path + ' resent,', keys.length,
+        'later records discarded with it');
+      return dbDelete(RECORDS, keys);
+    }).catch(function (err) {
+      // Named rather than swallowed: what survives a failure here is a record
+      // describing a turn the server no longer has, which the next visit draws
+      // over whichever message has taken that ordinal.
+      say('warn', LOG_IMG, 'could not discard the records after #' + index
+        + ' of ' + path + ':', err);
     });
   }
 
@@ -1204,9 +1231,24 @@
       var o = overrides[i];
       if (o.path === here) continue;
       dropView(o);
-      releaseThumbs(o.thumbs, null);
+      // Every url except the ones a held send is still able to put back. The
+      // rollback writes the snapshot's strings into the record as they stand,
+      // and a revoked blob: url is still a non-empty string, so it passes the
+      // drawable test and hangs an image that loads nothing over a carousel
+      // that was showing the right thing. The mint outlives this release only
+      // while a send is in flight against it.
+      releaseThumbs(o.thumbs, heldThumbs(o));
       overrides.splice(i, 1);
     }
+  }
+
+  // The thumbs a held send could still restore, or nothing. Read from the
+  // snapshot rather than the record, because the record is what the send has
+  // already overwritten.
+  function heldThumbs(o) {
+    if (!heldRecord || heldRecord.absent) return null;
+    if (heldPath !== o.path || heldDrop !== o.index) return null;
+    return heldRecord.thumbs;
   }
 
   // Runs again on every route change, because the pathname it filters on is
@@ -1245,10 +1287,18 @@
       // stale list §shape exists to avoid. A clean plan is thrown away and the
       // next scan pass builds it again off the record; a dirty one is holding
       // the user's edit, so it is kept and the cost is named instead.
-      if (plan && !plan.base && overrideAt(plan.index)) {
+      //
+      // Judged against the plan's own conversation, not the one on screen. This
+      // block runs after a store read, so it runs after a route change too, and
+      // an ordinal matched against the wrong thread named an unrelated message
+      // in an always-on report - on the ordinary act of clicking another
+      // conversation in the sidebar. A report the user learns to ignore is
+      // worse than none.
+      if (plan && plan.path === location.pathname && !plan.base
+        && overrideAtPath(plan.index, plan.path)) {
         if (planIsDirty(plan)) {
           reportDowngrade('edit built before its record loaded, its send may carry a stale list',
-            'message #' + plan.index);
+            'message #' + plan.index + ' of ' + plan.path);
         } else {
           discardPlan();
         }
@@ -1831,6 +1881,11 @@
       // another conversation misses every thumbnail, and a miss is a permanent
       // rename to image-<n>.jpg.
       conv: conversationId(),
+      // And the pathname beside it, because a record is keyed by pathname while
+      // an rpc is asked by conversation id, and the two are not interchangeable.
+      // Anything judging this plan after an await needs to know which thread it
+      // belongs to rather than which one is on screen by then.
+      path: location.pathname,
       base: base,
       baseBlobs: baseBlobs,
       originalCount: thumbs.length,
@@ -2657,8 +2712,8 @@
       report(w, 'first byte ' + (firstByteAt ? secs(firstByteAt - t0) : 'never')
         + ' | total ' + secs(end - t0));
       // A status the server refused with is not a truncation either.
-      if (xhr.status >= 200 && xhr.status < 300) sendLanded();
-      else sendFailed('http ' + xhr.status);
+      if (serverRefused(xhr)) sendFailed('http ' + xhr.status);
+      else sendLanded();
       noteGenerationFinished();
     });
     xhr.addEventListener('error', function () {
@@ -2748,7 +2803,19 @@
 
     var xhr = this;
     armSendOutcome(result, xhr, function (then) {
-      xhr.addEventListener('load', then);
+      xhr.addEventListener('load', function () {
+        // 'load' fires for a refusal as readily as for an answer. A resolved
+        // response is not a made turn: reloading on one resynchronises the view
+        // onto a turn that is not there, and a reference upgrade armed against
+        // one can only fail. The fetch path stated this rule and this one, the
+        // transport actually in use, did not follow it.
+        if (serverRefused(xhr)) {
+          say('warn', LOG_IMG, 'send: the server refused it, status ' + xhr.status
+            + ' - no reload and no reference refresh follow');
+          return;
+        }
+        then();
+      });
     });
     return xhrSend.call(this, result.body);
   };
@@ -2767,12 +2834,16 @@
   // directive is covered.
   var fetchSendSeen = false;
 
-  // One owner for "did the server turn this send down". It decides two separate
-  // consequences - whether the records roll back, and whether the reload, the
-  // reference refresh and the cost line run - and those consequences sat behind
-  // two copies of the same comparison inside one function. A later allowance on
-  // one copy alone (a 3xx, a 204) would roll a send's records back while still
-  // arming a refresh for it, or land them while treating the send as refused.
+  // One owner for "did the server turn this send down", across both transports.
+  // It decides two separate consequences - whether the records roll back, and
+  // whether the reload, the reference refresh and the cost line run - and those
+  // consequences sat behind three copies of the comparison: two inside hookFetch
+  // and one in traceStream, which is the path that actually runs. The XHR route
+  // never asked the second question at all and armed its outcome on any
+  // completed response. A later allowance on one copy alone (a 3xx, a 204) rolls
+  // a send's records back while still arming a refresh for it.
+  //
+  // Takes anything carrying a status: a Response and an XMLHttpRequest both do.
   function serverRefused(res) {
     return !!res && (res.status < 200 || res.status >= 300);
   }
@@ -3544,6 +3615,15 @@
         // No plan to report dirty through, so the sentinel is written by hand;
         // rewrite() strips it with or without a plan.
         writeTextarea(got.textarea, got.textarea.value + SENTINEL);
+        // And the hold by hand with it. Whether the records this resend
+        // discards are dealt with was answered by "does a plan exist", which
+        // the editor decides for its own unrelated reason - a message with no
+        // attachment and no preview container gets no plan at all, so a retry
+        // of one truncated the thread on the server and left every later
+        // record behind for syncOverrides to draw over whichever messages take
+        // those ordinals next. The server truncates on the resend, not on the
+        // toolbar being drawn.
+        holdSend(indexOfHost(host), location.pathname);
         reportRetryLead(t0);
         pressUpdate(host);
       }
@@ -3676,6 +3756,15 @@
   // present - a blank the user cannot tell from a quota the server declines to
   // report. Nothing is written unless at least one window came back with a
   // number in it.
+  // One owner for "is there a number here worth showing". Adoption counted a
+  // window as readable on either field being present while the line that draws
+  // it needs `used` specifically, so a payload carrying only `remaining` was
+  // adopted, stamped as read, and cleared the backoff - and then drew a bare
+  // dash, having already hidden Gemini's own disclaimer to make room for it.
+  function windowIsDrawable(w) {
+    return !!w && typeof w.used === 'number';
+  }
+
   function adoptUsage(payload) {
     var list = Array.isArray(payload) && Array.isArray(payload[1]) ? payload[1] : [];
     var next = {};
@@ -3689,7 +3778,7 @@
         used: typeof w[1] === 'number' ? w[1] : null,
         resetAt: typeof stamp === 'number' ? stamp * 1000 : null
       };
-      if (win.remaining !== null || win.used !== null) readable++;
+      if (windowIsDrawable(win)) readable++;
       next[w[2]] = win;
     }
     if (!readable) return false;
@@ -3827,7 +3916,7 @@
   // window that ended.
   function partText(label, kind) {
     var w = usage.windows && usage.windows[kind];
-    if (!w || typeof w.used !== 'number') return label + ' -';
+    if (!windowIsDrawable(w)) return label + ' -';
     if (w.resetAt && Date.now() >= w.resetAt) return label + ' -';
     var text = label + ' ' + (w.used * 100).toFixed(1) + '%';
     if (w.remaining !== null) text += ' · ' + grouped(w.remaining) + ' left';

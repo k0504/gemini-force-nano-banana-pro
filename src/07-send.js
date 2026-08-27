@@ -424,8 +424,8 @@
       report(w, 'first byte ' + (firstByteAt ? secs(firstByteAt - t0) : 'never')
         + ' | total ' + secs(end - t0));
       // A status the server refused with is not a truncation either.
-      if (xhr.status >= 200 && xhr.status < 300) sendLanded();
-      else sendFailed('http ' + xhr.status);
+      if (serverRefused(xhr)) sendFailed('http ' + xhr.status);
+      else sendLanded();
       noteGenerationFinished();
     });
     xhr.addEventListener('error', function () {
@@ -515,7 +515,19 @@
 
     var xhr = this;
     armSendOutcome(result, xhr, function (then) {
-      xhr.addEventListener('load', then);
+      xhr.addEventListener('load', function () {
+        // 'load' fires for a refusal as readily as for an answer. A resolved
+        // response is not a made turn: reloading on one resynchronises the view
+        // onto a turn that is not there, and a reference upgrade armed against
+        // one can only fail. The fetch path stated this rule and this one, the
+        // transport actually in use, did not follow it.
+        if (serverRefused(xhr)) {
+          say('warn', LOG_IMG, 'send: the server refused it, status ' + xhr.status
+            + ' - no reload and no reference refresh follow');
+          return;
+        }
+        then();
+      });
     });
     return xhrSend.call(this, result.body);
   };
@@ -534,12 +546,16 @@
   // directive is covered.
   var fetchSendSeen = false;
 
-  // One owner for "did the server turn this send down". It decides two separate
-  // consequences - whether the records roll back, and whether the reload, the
-  // reference refresh and the cost line run - and those consequences sat behind
-  // two copies of the same comparison inside one function. A later allowance on
-  // one copy alone (a 3xx, a 204) would roll a send's records back while still
-  // arming a refresh for it, or land them while treating the send as refused.
+  // One owner for "did the server turn this send down", across both transports.
+  // It decides two separate consequences - whether the records roll back, and
+  // whether the reload, the reference refresh and the cost line run - and those
+  // consequences sat behind three copies of the comparison: two inside hookFetch
+  // and one in traceStream, which is the path that actually runs. The XHR route
+  // never asked the second question at all and armed its outcome on any
+  // completed response. A later allowance on one copy alone (a 3xx, a 204) rolls
+  // a send's records back while still arming a refresh for it.
+  //
+  // Takes anything carrying a status: a Response and an XMLHttpRequest both do.
   function serverRefused(res) {
     return !!res && (res.status < 200 || res.status >= 300);
   }

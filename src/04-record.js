@@ -229,29 +229,56 @@
     o.thumbs = snap.thumbs;
     o.attachments = snap.attachments;
     o.blobs = snap.blobs;
+    // A writer like any other. Left unbumped, a record put back after a failed
+    // send still read as the generation that send installed, so an upgrade the
+    // same send armed passed its guard and went on to overwrite the rollback.
+    o.gen = nextGen();
     dropView(o);
     persistOverrides();
   }
 
   // The conversation is passed in, never read off the location: this runs when
-  // the send lands, which can be long after the user has routed elsewhere. The
-  // stored keys are built from the doomed rows themselves, so they were never
-  // wrong; the filter that chose those rows was.
+  // the send lands, which can be long after the user has routed elsewhere.
+  //
+  // The store decides which rows go, not the in-memory array. The array holds
+  // one conversation - whichever is on screen - and this runs precisely when
+  // that need not be the one the send belonged to: releaseOffPath will have
+  // emptied it of these very rows, an empty filter reads as "nothing to
+  // discard", and the records of turns the server has just thrown away survive
+  // for good. Nothing else deletes a record row, so there is no later pass to
+  // catch them; they come back on the next visit and are drawn over whichever
+  // messages now occupy those ordinals.
+  //
+  // The array is still cleaned, because what is on screen has to stop showing
+  // the discarded turns, but it is cleaned as a consequence rather than as the
+  // source of truth.
   function dropRecordsAfter(index, path) {
-    var doomed = overrides.filter(function (o) {
+    overrides.filter(function (o) {
       return o.path === path && o.index > index;
-    });
-    if (!doomed.length) return;
-    doomed.forEach(function (o) {
+    }).forEach(function (o) {
       dropView(o);
       releaseThumbs(o.thumbs);
       overrides.splice(overrides.indexOf(o), 1);
     });
-    var keys = doomed.map(function (o) { return o.path + '#' + o.index; });
-    dbg('dropRecordsAfter: message #' + index + ' of ' + path + ' resent,', keys.length,
-      'later records discarded with it');
-    dbDelete(RECORDS, keys).catch(function (err) {
-      say('warn', LOG_IMG, 'could not discard the records after #' + index + ':', err);
+
+    return dbReadAll(RECORDS).then(function (rows) {
+      var keys = rows.filter(function (r) {
+        return r && r.path === path && r.index > index;
+      }).map(function (r) { return r.path + '#' + r.index; });
+      if (!keys.length) {
+        dbg('dropRecordsAfter: message #' + index + ' of ' + path
+          + ' resent, no later records were on file');
+        return null;
+      }
+      dbg('dropRecordsAfter: message #' + index + ' of ' + path + ' resent,', keys.length,
+        'later records discarded with it');
+      return dbDelete(RECORDS, keys);
+    }).catch(function (err) {
+      // Named rather than swallowed: what survives a failure here is a record
+      // describing a turn the server no longer has, which the next visit draws
+      // over whichever message has taken that ordinal.
+      say('warn', LOG_IMG, 'could not discard the records after #' + index
+        + ' of ' + path + ':', err);
     });
   }
 
@@ -506,9 +533,24 @@
       var o = overrides[i];
       if (o.path === here) continue;
       dropView(o);
-      releaseThumbs(o.thumbs, null);
+      // Every url except the ones a held send is still able to put back. The
+      // rollback writes the snapshot's strings into the record as they stand,
+      // and a revoked blob: url is still a non-empty string, so it passes the
+      // drawable test and hangs an image that loads nothing over a carousel
+      // that was showing the right thing. The mint outlives this release only
+      // while a send is in flight against it.
+      releaseThumbs(o.thumbs, heldThumbs(o));
       overrides.splice(i, 1);
     }
+  }
+
+  // The thumbs a held send could still restore, or nothing. Read from the
+  // snapshot rather than the record, because the record is what the send has
+  // already overwritten.
+  function heldThumbs(o) {
+    if (!heldRecord || heldRecord.absent) return null;
+    if (heldPath !== o.path || heldDrop !== o.index) return null;
+    return heldRecord.thumbs;
   }
 
   // Runs again on every route change, because the pathname it filters on is
@@ -547,10 +589,18 @@
       // stale list §shape exists to avoid. A clean plan is thrown away and the
       // next scan pass builds it again off the record; a dirty one is holding
       // the user's edit, so it is kept and the cost is named instead.
-      if (plan && !plan.base && overrideAt(plan.index)) {
+      //
+      // Judged against the plan's own conversation, not the one on screen. This
+      // block runs after a store read, so it runs after a route change too, and
+      // an ordinal matched against the wrong thread named an unrelated message
+      // in an always-on report - on the ordinary act of clicking another
+      // conversation in the sidebar. A report the user learns to ignore is
+      // worse than none.
+      if (plan && plan.path === location.pathname && !plan.base
+        && overrideAtPath(plan.index, plan.path)) {
         if (planIsDirty(plan)) {
           reportDowngrade('edit built before its record loaded, its send may carry a stale list',
-            'message #' + plan.index);
+            'message #' + plan.index + ' of ' + plan.path);
         } else {
           discardPlan();
         }
