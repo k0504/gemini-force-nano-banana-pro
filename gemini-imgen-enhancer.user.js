@@ -6,7 +6,7 @@
 // @license      MIT
 // @homepageURL  https://github.com/k0504/gemini-imgen-enhancer
 // @supportURL   https://github.com/k0504/gemini-imgen-enhancer/issues
-// @version      3.44.0
+// @version      3.45.0
 // @description  Force Gemini image generation onto Nano Banana Pro from the first request, and edit the images attached to an existing prompt.
 // @description:zh-TW  自首次請求即強制以 Nano Banana Pro 生成圖片，並可編輯既有 prompt 附加的圖片。
 // @match        https://gemini.google.com/*
@@ -136,7 +136,7 @@
   var WIZ_KEYS = { pctx: 'Ylro7b', pushId: 'qKIAYe', at: 'SNlM0e', bl: 'cfb2h', sid: 'FdrFJe' };
 
   // §config ==================================================================
-  var VERSION = '3.44.0';
+  var VERSION = '3.45.0';
 
   // Gemini keeps its own Update button disabled until the prompt text differs
   // from what the message already holds, so an image-only change cannot be
@@ -314,16 +314,28 @@
     say.apply(null, ['log', LOG_IMG].concat(Array.prototype.slice.call(arguments)));
   }
 
+  // The channel every abandonment reports through. A branch that gives up the
+  // fast shape, throws a dirty plan away or renames a user's file charges the
+  // user something they never asked for - 55s, or a file name the server then
+  // keeps - and dbg() is off by default, so a branch that reports only there
+  // reports to nobody. Both halves are the point: `what` is the cost paid,
+  // `why` is the condition that failed, and a report missing either one leaves
+  // the next reader guessing which of the two it was.
+  function reportDowngrade(what, why) {
+    say('warn', LOG_IMG, 'degraded: ' + what + ' — ' + why);
+  }
+
   // Reads an attachment list as `kind[length]:name`, which is enough to tell at
-  // a glance whether a send is in the shape §shape is aiming for.
+  // a glance whether a send is in the shape §shape is aiming for. The kind is
+  // asked of attClass in §upload, the same call the gates make, so the line
+  // printed here cannot say a list was contrib while the gate that read it saw
+  // otherwise. attClass is declared further down the concatenated file, which
+  // is safe: function declarations hoist over the whole shared scope.
   function attShape(list) {
     if (!Array.isArray(list)) return String(list);
     return list.map(function (a) {
       if (!Array.isArray(a)) return '?';
-      var head = a[0] && a[0][0];
-      var kind = typeof head === 'string' && head.indexOf(CONTRIB_PREFIX) === 0
-        ? 'contrib' : (a.length >= 3 && typeof a[2] === 'string' ? 'token' : 'other');
-      return kind + '[' + a.length + ']:' + a[1];
+      return attClass(a) + '[' + a.length + ']:' + a[1];
     }).join(', ');
   }
 
@@ -492,9 +504,24 @@
   // An answer can carry more than one envelope: a generation is streamed as a
   // run of them, and which one holds the finished turn is not fixed, so every
   // one of them is handed back rather than the first.
+  // The first drop of each rpc is worth a line; the rest are not. A generation
+  // is streamed as a run of envelopes, so an answer that routinely carries one
+  // odd chunk would print a line per turn on a channel that is never off.
+  var wrbDropSeen = {};
+
+  function noteWrbDrops(rpcId, dropped, chars) {
+    var key = rpcId || 'ProcessFile';
+    var line = key + ': ' + dropped + ' envelope(s) unreadable and dropped (response '
+      + chars + ' chars)';
+    if (wrbDropSeen[key]) { dbg('wrb: ' + line); return; }
+    wrbDropSeen[key] = true;
+    say('warn', LOG_IMG, line);
+  }
+
   function wrbPayloads(text, rpcId) {
     var head = '[["wrb.fr",' + (rpcId ? '"' + rpcId + '"' : 'null') + ',"';
     var out = [];
+    var dropped = 0;
     var at = text.indexOf(head);
     while (at !== -1) {
       // The payload is a JSON string inside the envelope, so it ends at the
@@ -508,10 +535,15 @@
       try {
         out.push(JSON.parse(JSON.parse('"' + text.slice(from, to) + '"')));
       } catch (e) {
-        // A chunk that does not parse teaches nothing; the next one may.
+        // A chunk that does not parse teaches nothing; the next one may. It is
+        // still counted: five subsystems read the length of this array, and to
+        // every one of them a response of three envelopes and one of six with
+        // three unreadable look exactly alike.
+        dropped++;
       }
       at = text.indexOf(head, to);
     }
+    if (dropped) noteWrbDrops(rpcId, dropped, text.length);
     return out;
   }
 
@@ -537,9 +569,17 @@
     return 'f.req=' + encodeURIComponent(freq) + '&at=' + encodeURIComponent(at) + '&';
   }
 
+  // The same figure §library's gmGet is given, for the same reason: generous
+  // against the megabytes a conversation load answers with on a slow line, and
+  // far short of the forever a missing deadline means. Forever is not an
+  // abstraction here - a request that never settles holds §usage's inFlight and
+  // §origins' harvesting flag for the life of the document, and every trigger
+  // that would have reset them is refused while they are held.
+  var RPC_TIMEOUT_MS = 90000;
+
   function rpcPost(url, freq, rpcId, label) {
     var doneFetch = dbgT((label || rpcId || 'rpc') + ': rpc round-trip');
-    return fetch(url, {
+    var request = fetch(url, {
       method: 'POST',
       credentials: 'include',
       headers: {
@@ -548,10 +588,34 @@
       },
       body: rpcBody(freq)
     }).then(function (res) {
-      return res.text();
+      return res.text().then(function (text) {
+        // A refusal and a verification page both answer a body holding no
+        // envelope at all, and 'no <rpcid> payload' names neither which of the
+        // two it was nor that the server said anything about it. The status is
+        // the whole of that answer, so it is not thrown away here.
+        if (!res.ok) {
+          throw new Error((rpcId || 'ProcessFile') + ' answered http ' + res.status
+            + ' (' + text.length + ' chars)');
+        }
+        return text;
+      });
     }).then(function (text) {
       doneFetch(text.length, 'chars');
       return wrbPayload(text, rpcId);
+    });
+    var timer = null;
+    var deadline = new Promise(function (resolve, reject) {
+      timer = setTimeout(function () {
+        reject(new Error((rpcId || 'ProcessFile') + ' did not answer within '
+          + (RPC_TIMEOUT_MS / 1000) + 's'));
+      }, RPC_TIMEOUT_MS);
+    });
+    return Promise.race([request, deadline]).then(function (payload) {
+      clearTimeout(timer);
+      return payload;
+    }, function (err) {
+      clearTimeout(timer);
+      throw err;
     });
   }
 
@@ -754,35 +818,79 @@
   // The only caller is commitSend, so this covers the resends this script
   // commits. A resend that never reaches it leaves its later records behind for
   // the budget: a retry of a message with no attachments arms no plan at all,
-  // and an unchanged list on a message with no record exits before the commit.
-  // Both are sends this script has nothing to write for, which is why neither
-  // has an index to drop from.
+  // so there is no message index to drop from. An edit that changes only the
+  // text of a message with no record does reach the commit - it writes no list,
+  // but the server truncates behind it, and leaving before the hold was armed
+  // is what left those turns' records behind as orphans.
   // The drop and the snapshot below are what makes a send reversible. Both
   // used to run while the request body was still being built, so a send that
   // never reached the server - a dropped connection, a tab closed mid-flight -
   // deleted the records of turns the server never truncated and left the record
   // for this message claiming a list that was never sent.
   var heldDrop = null;
+  var heldPath = null;
   var heldRecord = null;
 
-  function holdSend(index) {
+  // The conversation is pinned when the hold is armed rather than read again
+  // when the send settles. A send that lands after the user has routed away
+  // still truncated the conversation it was made in, and the records it owes
+  // are that conversation's; resolving against whatever is on screen by then
+  // either spares those orphans or takes another thread's records instead.
+  function holdSend(index, path) {
+    // -1 is indexOfHost saying the message has already left the tree, and
+    // dropRecordsAfter(-1) would take every record in the conversation with
+    // it. Nothing is held - including anything an earlier send left held,
+    // which this send's outcome would otherwise resolve against an ordinal
+    // that is not its own.
+    if (typeof index !== 'number' || index < 0) {
+      say('warn', LOG_IMG, 'send held with no message index, records left untouched');
+      heldDrop = null;
+      heldPath = null;
+      heldRecord = null;
+      // Said out loud, because the caller went on to write a record at that
+      // same index and the warning above then described the opposite of what
+      // happened. Refusing to hold and refusing to write are one decision.
+      return false;
+    }
     heldDrop = index;
+    heldPath = path;
     heldRecord = snapshotOverride(index);
+    return true;
   }
 
   function sendLanded() {
     var index = heldDrop;
+    var path = heldPath;
     heldDrop = null;
+    heldPath = null;
     heldRecord = null;
     if (index === null) return;
-    dropRecordsAfter(index);
+    // Against the pinned conversation, wherever the user is by now: the server
+    // truncated that one, so its later records describe turns that no longer
+    // exist whether or not it is still the conversation on screen.
+    dropRecordsAfter(index, path);
   }
 
   function sendFailed(why) {
     if (heldDrop === null) return;
     var snap = heldRecord;
+    var index = heldDrop;
+    var path = heldPath;
     heldDrop = null;
+    heldPath = null;
     heldRecord = null;
+    // The rollback is the half that cannot be done from a pinned path:
+    // restoreOverride finds its record through overrideAt and keys its delete
+    // by the pathname on screen, both of which describe the conversation being
+    // looked at. Rather than write this conversation's record from another
+    // one's snapshot, the hold is resolved and what it cost is named.
+    if (path !== location.pathname) {
+      reportDowngrade('the record for message #' + index + ' is left as the send wrote it '
+        + 'rather than put back',
+        'the send did not go out (' + why + ') and the page moved from ' + path
+        + ' to ' + location.pathname + ' before the rollback could run');
+      return;
+    }
     say('warn', LOG_IMG, 'the send did not go out (' + why + '); the later records are kept '
       + 'and the record for this message is put back as it was');
     restoreOverride(snap);
@@ -823,9 +931,13 @@
     persistOverrides();
   }
 
-  function dropRecordsAfter(index) {
+  // The conversation is passed in, never read off the location: this runs when
+  // the send lands, which can be long after the user has routed elsewhere. The
+  // stored keys are built from the doomed rows themselves, so they were never
+  // wrong; the filter that chose those rows was.
+  function dropRecordsAfter(index, path) {
     var doomed = overrides.filter(function (o) {
-      return o.path === location.pathname && o.index > index;
+      return o.path === path && o.index > index;
     });
     if (!doomed.length) return;
     doomed.forEach(function (o) {
@@ -834,7 +946,7 @@
       overrides.splice(overrides.indexOf(o), 1);
     });
     var keys = doomed.map(function (o) { return o.path + '#' + o.index; });
-    dbg('dropRecordsAfter: message #' + index + ' resent,', keys.length,
+    dbg('dropRecordsAfter: message #' + index + ' of ' + path + ' resent,', keys.length,
       'later records discarded with it');
     dbDelete(RECORDS, keys).catch(function (err) {
       say('warn', LOG_IMG, 'could not discard the records after #' + index + ':', err);
@@ -864,6 +976,14 @@
     return n;
   }
 
+  // Which conversations the in-memory array is still carrying. Asked instead of
+  // the pathname on screen because the pathname is only true for the instant it
+  // is read: this runs from a route change, and every conversation visited
+  // since the document opened still holds its bytes here.
+  function pathHeldInMemory(path) {
+    return overrides.some(function (o) { return o.path === path; });
+  }
+
   function pruneStore() {
     return dbReadAll(RECORDS).then(function (rows) {
       var held = 0;
@@ -872,10 +992,11 @@
         dbg('pruneStore:', (held / 1048576).toFixed(1) + 'MB held, within the budget');
         return null;
       }
-      // The conversation on screen is never a candidate: its bytes are held in
-      // memory as well, so the next send would write them straight back.
+      // A conversation this document has open is never a candidate: its bytes
+      // are held in memory as well, so the next send would write them straight
+      // back.
       var evictable = rows.filter(function (r) {
-        return prunable(r) && r.path !== location.pathname;
+        return prunable(r) && !pathHeldInMemory(r.path);
       }).sort(function (a, b) { return (a.savedAt || 0) - (b.savedAt || 0); });
 
       var freed = 0;
@@ -955,13 +1076,28 @@
     return o && Array.isArray(o.blobs) ? o.blobs.slice() : null;
   }
 
-  function overrideAt(index) {
+  function overrideAtPath(index, path) {
     for (var i = 0; i < overrides.length; i++) {
-      if (overrides[i].index === index && overrides[i].path === location.pathname) {
+      if (overrides[i].index === index && overrides[i].path === path) {
         return overrides[i];
       }
     }
     return null;
+  }
+
+  function overrideAt(index) {
+    return overrideAtPath(index, location.pathname);
+  }
+
+  // One counter for every record this document writes, rather than a count
+  // kept per record. A per-record count starts at 1 for each of them, so two
+  // records - one per conversation - read as the same generation, and a guard
+  // comparing them lets exactly the mix-up it was written to stop straight
+  // through. Monotonic here means a generation names one record's one state.
+  var recordGen = 0;
+  function nextGen() {
+    recordGen += 1;
+    return recordGen;
   }
 
   // A thumbnail replaced is a thumbnail nothing can reach: a blob: URL pins its
@@ -994,6 +1130,13 @@
       existing.thumbs = thumbs;
       existing.attachments = attachments;
       existing.blobs = blobs || [];
+      // A record is rewritten in place, so a deferred write holding this
+      // object still holds the right object while its content has become
+      // another send's. The counter is the only thing that tells those two
+      // apart: a write armed against generation 3 refuses a record that has
+      // since become 4. It is not persisted, because a record read back from
+      // the store has no deferred write waiting on it.
+      existing.gen = nextGen();
       dropView(existing);
     } else {
       overrides.push({
@@ -1002,6 +1145,7 @@
         thumbs: thumbs,
         attachments: attachments,
         blobs: blobs || [],
+        gen: nextGen(),
         view: null
       });
     }
@@ -1045,8 +1189,33 @@
     });
   }
 
+  // Every record belongs to one conversation, and only the one on screen can be
+  // read, drawn or sent from. Keeping the rest costs a blob: URL per thumb that
+  // nothing revokes and every byte they hold, and it is read by pathHeldInMemory
+  // as "this conversation is open" - so the longer a session runs, the smaller
+  // the set §store is allowed to evict, and the budget stops being a budget.
+  //
+  // Dropping them loses nothing: every writer persists, so what is released here
+  // is already in the store and restoreOverrides reads it back on return. The
+  // in-flight dbWrite holds its own snapshot and is unaffected.
+  function releaseOffPath() {
+    var here = location.pathname;
+    for (var i = overrides.length - 1; i >= 0; i--) {
+      var o = overrides[i];
+      if (o.path === here) continue;
+      dropView(o);
+      releaseThumbs(o.thumbs, null);
+      overrides.splice(i, 1);
+    }
+  }
+
+  // Runs again on every route change, because the pathname it filters on is
+  // whatever is on screen at the moment it is called and the landing page is
+  // never the conversation. Idempotent per path: a record already in the array
+  // is left where it is.
   function restoreOverrides() {
-    dbReadAll(RECORDS).then(function (kept) {
+    releaseOffPath();
+    return dbReadAll(RECORDS).then(function (kept) {
       var mine = kept.filter(function (r) { return r && r.path === location.pathname; });
       if (!mine.length) return;
       mine.forEach(function (r) {
@@ -1065,13 +1234,29 @@
           }),
           attachments: r.attachments,
           blobs: blobs,
+          gen: nextGen(),
           view: null
         });
       });
       dbg('restoreOverrides:', mine.length, 'records read back for this conversation');
       schedule();
-    }).catch(function () {
-      // Nothing to restore.
+      // The read is asynchronous, so a plan built in the milliseconds before it
+      // landed found no record and took the request body as its base - the
+      // stale list §shape exists to avoid. A clean plan is thrown away and the
+      // next scan pass builds it again off the record; a dirty one is holding
+      // the user's edit, so it is kept and the cost is named instead.
+      if (plan && !plan.base && overrideAt(plan.index)) {
+        if (planIsDirty(plan)) {
+          reportDowngrade('edit built before its record loaded, its send may carry a stale list',
+            'message #' + plan.index);
+        } else {
+          discardPlan();
+        }
+      }
+    }).catch(function (err) {
+      // Resolving, not rethrowing: the prune chained onto this reads the store
+      // for itself and has no reason to be skipped because the restore failed.
+      say('warn', LOG_IMG, 'could not restore the attachment records:', err);
     });
   }
 
@@ -1307,13 +1492,29 @@
       && typeof n[5] === 'string' && n[5].indexOf('$') === 0;
   }
 
-  // The one request that asks the server what this conversation holds. Both
+  // The one request that asks the server what a conversation holds. Both
   // readers below parse the same payload; only how they find their message in
   // it differs.
-  function listConversation(label) {
-    var conv = conversationId();
-    if (!conv) return Promise.reject(new Error('no conversation on screen'));
-    return batchExecute(LIST_CONVERSATION_RPC, [conv, 10, null, 1, [1], [4], null, 1], label);
+  //
+  // Which conversation is the caller's to say when it has one pinned. Both
+  // readers are armed at one moment and resolve at another, and reading the
+  // location at request time answered whichever conversation the user had
+  // routed to in between - a name map from the wrong thread, or an upgrade
+  // aimed at a turn that is not there.
+  function listConversation(label, conv) {
+    // Falling back to the live read defeats the point of being handed a pinned
+    // id: both callers defer across an rpc, and the conversation on screen when
+    // the answer is wanted need not be the one the question was asked about.
+    var id = conv;
+    if (!id) {
+      id = conversationId();
+      if (id) {
+        reportDowngrade(label + ' reads whichever conversation is on screen',
+          'it was given no conversation id to pin to');
+      }
+    }
+    if (!id) return Promise.reject(new Error('no conversation on screen'));
+    return batchExecute(LIST_CONVERSATION_RPC, [id, 10, null, 1, [1], [4], null, 1], label);
   }
 
   // A thumbnail URL identifies one attachment, which a file name does not: the
@@ -1331,8 +1532,8 @@
   // message being edited for the first time has no record to read one from.
   // Without it every existing image is re-uploaded as image-<n>.jpg, and the
   // resend makes that the name the server keeps from then on.
-  function namesByThumb() {
-    return listConversation('namesByThumb').then(function (parsed) {
+  function namesByThumb(conv) {
+    return listConversation('namesByThumb', conv).then(function (parsed) {
       var names = {};
       (function walk(node) {
         if (!Array.isArray(node)) return;
@@ -1353,17 +1554,39 @@
   // array or the two describe different lists. Passing it in let an earlier
   // send's count meet a later send's record, which could only ever fail to
   // match.
-  function refreshOverride(index, attempt) {
+  //
+  // Everything below is aimed by an ordinal within a conversation, and none of
+  // it runs before 800ms after the send - seconds, once the retry below is
+  // counted. By then the user may be looking at another conversation, and the
+  // record at that ordinal may be a second send's, so both are pinned when the
+  // upgrade is armed and refused when they no longer hold. Object identity
+  // cannot stand in for the second check: installOverride rewrites a record in
+  // place, so the object is still the same object after another send has
+  // replaced everything in it.
+  function refreshOverride(index, attempt, conv, path, gen) {
+    // The ordinal counts messages in one conversation and means nothing in
+    // another. Re-reading it here wrote one turn's tokens into whichever
+    // record happened to sit at the same position in the thread the user had
+    // routed to, and then dropped that record's bytes.
+    if (location.pathname !== path) {
+      reportDowngrade('reference upgrade dropped, later resends of this message stay slow',
+        'the page moved from ' + path + ' to ' + location.pathname + ' before the upgrade ran');
+      return;
+    }
     var o = overrideAt(index);
     dbg('refreshOverride: fire, message #' + index + ', expect',
       o ? o.attachments.length : 0, 'attachments, attempt', attempt,
       '(record ' + (o ? 'found' : 'MISSING') + ')');
-    if (!o) return;
+    if (!o) {
+      reportDowngrade('reference upgrade dropped, later resends of this message stay slow',
+        'message #' + index + ' has no record left to upgrade');
+      return;
+    }
     // One separator for both sides of the comparison. It was a space on one
     // and a NUL on the other, which could only ever match a single-attachment
     // record and left every multi-image message stuck on its contrib paths.
     var SEP = '\u0000';
-    listConversation('refreshOverride').then(function (parsed) {
+    listConversation('refreshOverride', conv).then(function (parsed) {
       var wantNames = o.attachments.map(function (a) { return a[1]; }).sort().join(SEP);
       var expectedCount = o.attachments.length;
       var tuples = null;
@@ -1381,13 +1604,36 @@
       if (!tuples) {
         dbg('refreshOverride: no list matching the record\'s file names yet');
         if (attempt < 2) {
-          setTimeout(function () { refreshOverride(index, attempt + 1); }, 1500);
+          setTimeout(function () {
+            refreshOverride(index, attempt + 1, conv, path, gen);
+          }, 1500);
           return;
         }
         throw new Error('no attachment list matching the record');
       }
-      var current = overrideAt(index);
-      if (!current) return;
+      // By the pinned path, never the live one. overrideAt reads
+      // location.pathname, and the rpc above is long enough for the user to
+      // have routed elsewhere; the ordinal then resolves to whichever record
+      // sits at the same position in the conversation now on screen, and what
+      // follows would write this turn's tokens into it and destroy its bytes.
+      // The entry guard cannot cover this - it runs before the rpc, not after.
+      if (location.pathname !== path) {
+        reportDowngrade('reference upgrade dropped, later resends of this message stay slow',
+          'the page moved from ' + path + ' to ' + location.pathname
+          + ' while the upgrade was in flight');
+        return;
+      }
+      var current = overrideAtPath(index, path);
+      // The record this upgrade was armed for, or nothing. A second send to
+      // the same message rewrote it in place while the rpc was in flight, and
+      // what follows would replace that send's own list with the tokens of the
+      // turn the server has just been asked about and then destroy its bytes.
+      if (!current || current.gen !== gen) {
+        reportDowngrade('reference upgrade dropped, later resends of this message stay slow',
+          'message #' + index + ' was rewritten while the upgrade was in flight (generation '
+          + gen + ' -> ' + (current ? current.gen : 'gone') + ')');
+        return;
+      }
       current.attachments = tuples.map(function (t) {
         return [[null, 1, 1, t[11]], t[2], t[5]];
       });
@@ -1403,6 +1649,10 @@
       var freed = 0;
       (current.blobs || []).forEach(function (b) { if (b) freed += b.size || 0; });
       current.blobs = [];
+      // A writer like any other. The retry of a send that failed after this
+      // one landed is armed against the generation it reads then, not the one
+      // the upgrade started from.
+      current.gen = nextGen();
       dbg('refreshOverride: released', (freed / 1048576).toFixed(2) + 'MB of image bytes,',
         'the record now reads from the server references');
       persistOverrides();
@@ -1441,6 +1691,24 @@
   function isContribTuple(t) {
     return Array.isArray(t) && Array.isArray(t[0]) && typeof t[0][0] === 'string'
       && t[0][0].indexOf(CONTRIB_PREFIX) === 0;
+  }
+
+  // The only answer to "what is this attachment". The question used to be asked
+  // in four places that disagreed: §shape gated on the prefix alone, so a
+  // contrib minted by a dead document passed; §freshen and §retry each asked
+  // the prefix and the mint separately; and the console label asked the prefix
+  // without even the Array.isArray guard. A line an operator read could
+  // therefore contradict the gate that made the decision, which is how a live
+  // fix read as a reverted one. Both predicates above stay private to this file
+  // so the disagreement cannot come back.
+  //   contrib-live   this document minted it and is still inside CONTRIB_TTL_MS
+  //   contrib-stale  a contrib path, but not one this document can vouch for
+  //   token          the server reference §refresh writes back into a record
+  //   other          anything else, a native prompt tuple included
+  function attClass(t) {
+    if (isContribTuple(t)) return contribIsOurs(t[0][0]) ? 'contrib-live' : 'contrib-stale';
+    if (Array.isArray(t) && t.length >= 3 && typeof t[2] === 'string') return 'token';
+    return 'other';
   }
 
   function uploadFile(file) {
@@ -1557,6 +1825,12 @@
       host: host,
       container: container,
       index: index,
+      // Which conversation this plan's entries came from. The name lookup it
+      // arms below resolves an rpc later, and asking the location by then
+      // answered whichever thread the user had routed to: a name map from
+      // another conversation misses every thumbnail, and a miss is a permanent
+      // rename to image-<n>.jpg.
+      conv: conversationId(),
       base: base,
       baseBlobs: baseBlobs,
       originalCount: thumbs.length,
@@ -1605,6 +1879,17 @@
   function activePlan() {
     if (!plan) return null;
     if (plan.armedAt !== null && Date.now() - plan.armedAt > PLAN_TTL_MS) {
+      // A dirty plan that expires takes the user's edit with it, and the send
+      // that reads this getter a moment later goes out without it, so the loss
+      // is reported. A clean one is the ordinary editor closed with Escape:
+      // nothing was staged, the next send is usually an unrelated composer
+      // message, and a warning there would name a loss that never happened.
+      if (planIsDirty(plan)) {
+        reportDowngrade('edit plan expired unsent, its changes are dropped',
+          'message #' + plan.index);
+      } else {
+        dbg('activePlan: plan #' + plan.index + ' expired unsent with nothing staged');
+      }
       plan = null;
       return null;
     }
@@ -1714,7 +1999,7 @@
       return typeof entry.thumb === 'string' && entry.thumb.indexOf('http') === 0;
     });
     if (!reachable) return null;
-    p.names = namesByThumb().catch(function (err) {
+    p.names = namesByThumb(p.conv).catch(function (err) {
       dbg('planNames: names unavailable, falling back to image-<n>.jpg (' + err + ')');
       return null;
     });
@@ -1725,11 +2010,25 @@
     var known = p.base && p.base[entry.index];
     if (known && typeof known[1] === 'string' && known[1]) return Promise.resolve(known[1]);
     var pending = planNames(p);
-    if (!pending) return Promise.resolve(fallbackName(entry.index));
+    // The only branch in this file whose cost is not time. The name handed to
+    // the upload becomes the name the resent message carries, so falling back
+    // here renames the user's file to image-<n>.jpg on the server for good -
+    // there is no later pass that puts the original back.
+    if (!pending) {
+      reportDowngrade('original file name lost for existing#' + entry.index
+        + ', re-uploading as ' + fallbackName(entry.index)
+        + ' — the server keeps that name permanently',
+        'no record name and no server name for this thumbnail');
+      return Promise.resolve(fallbackName(entry.index));
+    }
     return pending.then(function (byThumb) {
       var found = byThumb && byThumb[thumbKey(entry.thumb)];
       if (!found) {
         dbg('freshen: existing#' + entry.index, 'the server reports no name for this thumbnail');
+        reportDowngrade('original file name lost for existing#' + entry.index
+          + ', re-uploading as ' + fallbackName(entry.index)
+          + ' — the server keeps that name permanently',
+          'no record name and no server name for this thumbnail');
       }
       return found || fallbackName(entry.index);
     });
@@ -1744,6 +2043,10 @@
         dbg('freshen: existing#' + entry.index, 'fresh contrib ready');
       }).catch(function (err) {
         entry.freshPending = false;
+        // Kept so the send that gives up on this entry can say which of the two
+        // it is looking at: an upload still running is worth waiting for, one
+        // that failed never becomes fast and the wait is spent for nothing.
+        entry.freshError = String(err);
         say('warn', LOG_IMG, 'freshen failed for existing#' + entry.index + ':', err);
       });
   }
@@ -1760,7 +2063,7 @@
         // already the shape the send wants, so uploading over it buys nothing
         // and costs a round trip per image on every edit - which is now every
         // edit, since this runs unconditionally.
-        if (isContribTuple(known) && contribIsOurs(known[0][0])) {
+        if (attClass(known) === 'contrib-live') {
           entry.freshAttachment = known;
           dbg('freshen: existing#' + entry.index, 'contrib from this document, reused as-is');
           return null;
@@ -1778,6 +2081,7 @@
         });
       }).catch(function (err) {
         entry.freshPending = false;
+        entry.freshError = String(err);
         say('warn', LOG_IMG, 'freshen failed for existing#' + entry.index + ':', err);
       });
     });
@@ -1790,27 +2094,32 @@
   }
 
   // §apply ===================================================================
-  // Writes the plan into the outgoing prompt tuple. Returns whether the
-  // attachment list was written, or null when neither it nor the sentinel
-  // needed touching.
+  // Whether the send being built is the resend of an edited message. Asked in
+  // two places - before the list is written, and by the §resend route that owes
+  // the record a truncation hold even when it has no list to write - so the
+  // comparison itself lives in one, and the two cannot drift into disagreeing
+  // about which sends a plan speaks for.
+  function isEditResend(inner) {
+    return inner[ACTION_INDEX] === ACTION_EDIT_RESEND;
+  }
+
+  // Writes the plan into the outgoing prompt tuple. null means only that this
+  // send is not the one the plan was made for; true that the attachment list
+  // was written, false that it was backed out of - a send that is still an edit
+  // resend, and still owes the record everything §commit gives one.
+  //
+  // The sentinel is not this function's to strip. rewrite() takes it off every
+  // send that carries it, plan or no plan, which is the only rule that also
+  // covers the retry of a message with no attachments; a second strip here
+  // could only ever find nothing and read as though it were doing the work.
   function applyPlanTo(inner, p, fresh) {
-    if (inner[ACTION_INDEX] !== ACTION_EDIT_RESEND) {
+    if (!isEditResend(inner)) {
       dbg('applyPlanTo: action is', JSON.stringify(inner[ACTION_INDEX]), '(not edit resend 2), skip');
       return null;
     }
 
     var tuple = inner[PROMPT_TUPLE];
-    var textChanged = false;
     var listWritten = false;
-
-    // The sentinel is ours and must never reach the server. It is stripped
-    // before the attachment rewrite so that it still goes when that backs out.
-    if (p.sentinelApplied && typeof tuple[PROMPT_TEXT] === 'string'
-      && tuple[PROMPT_TEXT].indexOf(SENTINEL) !== -1) {
-      tuple[PROMPT_TEXT] = tuple[PROMPT_TEXT].split(SENTINEL).join('');
-      textChanged = true;
-      dbg('applyPlanTo: sentinel stripped from prompt text');
-    }
 
     // The body's own list is what this message holds only while it has never
     // been resent; after that the record is, and the body carries the stale one.
@@ -1849,7 +2158,6 @@
       dbg('applyPlanTo: wrote', attShape(tuple[ATTACHMENTS]));
     }
 
-    if (!textChanged && !listWritten) return null;
     return listWritten;
   }
 
@@ -1885,17 +2193,24 @@
   // 2.0s to first byte, against 21.3s for the same send with it left in.
   function chooseSendShape(inner, written, hasNew) {
     var allContrib = Array.isArray(written) && written.length > 0
-      && written.every(isContribTuple);
+      && written.every(function (att) { return attClass(att) === 'contrib-live'; });
     work.images = Array.isArray(written) ? written.length : 0;
     work.shape = allContrib ? 'brand-new upload shape' : 'edit resend';
 
     if (!allContrib) {
-      // Something in the list is still a server reference, so the send cannot
-      // take the shape above and goes out as the edit resend it is. Clearing
-      // the action alone is still worth it when an upload is present, that
-      // combination being the slowest thing the server answers.
+      // Something in the list is a server reference, or a contrib this document
+      // cannot vouch for, so the send cannot take the shape above and goes out
+      // as the edit resend it is. Clearing the action alone is still worth it
+      // when an upload is present, that combination being the slowest thing the
+      // server answers.
       if (hasNew) inner[ACTION_INDEX] = null;
-      dbg('chooseSendShape: list is not all contribs, sent as an edit resend');
+      dbg('chooseSendShape: not every attachment is contrib-live, sent as an edit resend |',
+        attShape(written));
+      // The timing table above is what the user is paying here, so it is quoted
+      // rather than described: this is the one decision in the send path whose
+      // cost is a minute of waiting the user cannot account for otherwise.
+      reportDowngrade('brand-new upload shape abandoned, sent as edit resend '
+        + '(measured 79.9s vs 24.2s)', attShape(written));
       return;
     }
 
@@ -1917,6 +2232,28 @@
   }
 
   // §resend ==================================================================
+  // A send this script declines to write, on a message whose resend still
+  // discards every turn after it. The list goes out as the page built it; the
+  // records for the discarded turns go with them either way, so the commit is
+  // owed whether or not anything was written. Leaving before it is what left
+  // them behind as orphans for syncOverrides to draw over unrelated messages.
+  //
+  // Only when the send really is the resend: a plan left idling while the user
+  // types into the composer would otherwise arm a truncation hold against a
+  // message that send never touched.
+  function backOut(inner, p, why) {
+    if (!isEditResend(inner)) {
+      dbg('editorContribution: backing out -', why, '- and this send is not the resend');
+      return null;
+    }
+    reportDowngrade('the attachment list goes out as the page built it, and the turns after '
+      + 'this message are discarded with their records', why);
+    commitSend(p, inner[PROMPT_TUPLE][ATTACHMENTS], false);
+    plan = null;
+    teardownEditorUi();
+    return null;
+  }
+
   function editorContribution(inner) {
     if (!imageEditor) return null;
     var p = activePlan();
@@ -1943,9 +2280,7 @@
       // the retry reuses it: an entry whose upload failed has no attachment to
       // write, and applyPlanTo dereferenced it.
       if (!planIsReady(p)) {
-        say('warn', LOG_IMG, 'retry: an upload on the plan for this message never '
-          + 'finished, attachments left untouched');
-        return null;
+        return backOut(inner, p, 'an upload on the plan for this message never finished');
       }
       var kept = applyPlanTo(inner, p, false);
       // The same reading of that return as the route below: null means this
@@ -1960,17 +2295,46 @@
     }
     // An unchanged list still has to be written when the message carries a
     // record, because the body Gemini builds is the one from before the resend
-    // that produced it.
-    if (!dirty && !p.base) return null;
-    if (dirty && !planIsReady(p)) {
-      say('warn', LOG_IMG, 'an upload has not finished, attachments left untouched');
+    // that produced it. With no record and no change there is no list worth
+    // writing - but the send is still a resend of an edited message, the server
+    // still discards every turn after it, and the records for those turns still
+    // have to go with them. Leaving before the commit is what left them behind
+    // as orphans for syncOverrides to draw over unrelated messages.
+    //
+    // Only for a send that is actually the resend, though: a plan left idling
+    // while the user types into the composer would otherwise arm a truncation
+    // hold against a message that send never touched.
+    if (!dirty && !p.base) {
+      if (!isEditResend(inner)) {
+        dbg('editorContribution: nothing staged and no record, and this send is not the resend');
+        return null;
+      }
+      dbg('editorContribution: nothing to write, the body goes as it stands and the record is held');
+      commitSend(p, inner[PROMPT_TUPLE][ATTACHMENTS], false);
+      plan = null;
+      teardownEditorUi();
       return null;
+    }
+    if (dirty && !planIsReady(p)) {
+      return backOut(inner, p, 'an upload staged in this edit has not finished');
     }
 
     var hasNew = p.entries.some(function (entry) { return entry.kind === 'new'; });
     var fresh = freshReady(p);
     if (!fresh) {
       dbg('editorContribution: re-uploads not finished, the record\'s own references are sent');
+      // Naming the entries, because the two ways to arrive here want opposite
+      // things from the user: an upload still running means the next send of
+      // the same message is fast, one that failed means this plan never will
+      // be and the image wants replacing by hand.
+      reportDowngrade('re-uploads unfinished, the record\'s own references are sent '
+        + 'instead (measured 79.9s vs 24.2s)',
+        p.entries.filter(function (entry) {
+          return entry.kind === 'existing' && !entry.freshAttachment;
+        }).map(function (entry) {
+          return 'existing#' + entry.index + ' '
+            + (entry.freshError ? 'failed: ' + entry.freshError : 'still uploading');
+        }).join(', '));
     }
 
     var listWritten = applyPlanTo(inner, p, fresh);
@@ -2014,15 +2378,22 @@
     // to discard. §store resolves the hold on the send's outcome, and the
     // record written below is restored to what it was if that outcome is a
     // failure. Unconditional, and ahead of the verdict below: a send that
-    // backed out of the list is still a resend.
-    holdSend(p.index);
+    // backed out of the list, or never had one to write, is still a resend and
+    // the server truncates behind it just the same.
+    // The conversation goes with it. §store resolves the hold when the
+    // response lands, which is long enough for a route change to have made the
+    // pathname on screen someone else's.
+    // Refusing to hold and refusing to write are one decision: without a hold
+    // there is no ordinal this send's outcome can be resolved against, and a
+    // record written at that same ordinal is one nothing will ever put back.
+    if (!holdSend(p.index, location.pathname)) return false;
 
-    // applyPlanTo backed out, so the only list to hand is the one the page
-    // built, which need not be as long as the thumbs and blobs beside it. A
-    // record whose three arrays disagree is worse than the one already on file:
-    // prunable() requires thumbs and blobs to match, nameFor() indexes
-    // attachments by the thumb's index, and refreshOverride() counts one array
-    // and names the other.
+    // Either applyPlanTo backed out or there was never a list to write, so the
+    // only one to hand is the one the page built, which need not be as long as
+    // the thumbs and blobs beside it. A record whose three arrays disagree is
+    // worse than the one already on file: prunable() requires thumbs and blobs
+    // to match, nameFor() indexes attachments by the thumb's index, and
+    // refreshOverride() counts one array and names the other.
     if (!listWritten) {
       dbg('commitSend: the list was not written, the record is left as it stands');
       return false;
@@ -2049,7 +2420,19 @@
     // here as well would state the same rule in a second place, and only one of
     // the two would be reached.
     if (stored) {
-      pendingRefresh = { index: p.index };
+      // Everything the upgrade will be aimed by, read here rather than there.
+      // It runs 800ms after the response at the earliest, by which time the
+      // pathname is whatever the user routed to and the record at this ordinal
+      // may belong to a later send; the generation is the one installOverride
+      // has just written, and it is what tells that later send's record from
+      // this one when both are the same object.
+      var justStored = overrideAt(p.index);
+      pendingRefresh = {
+        index: p.index,
+        path: location.pathname,
+        conv: conversationId(),
+        gen: justStored ? justStored.gen : 0
+      };
     }
     // Reloading is the fallback for a record that could not be kept: without
     // one, the message on screen is the one from before this send.
@@ -2322,7 +2705,9 @@
       whenDone(function () {
         // After the stream closes the turn is on the server, so its durable
         // references can be fetched; the delay leaves room for the commit.
-        setTimeout(function () { refreshOverride(refresh.index, 0); }, 800);
+        setTimeout(function () {
+          refreshOverride(refresh.index, 0, refresh.conv, refresh.path, refresh.gen);
+        }, 800);
       });
     }
   }
@@ -2380,19 +2765,35 @@
   // nothing at all. `@sandbox raw` in the header settles it - the two windows
   // are one - and both are still patched so a manager that ignores the
   // directive is covered.
+  var fetchSendSeen = false;
+
+  // One owner for "did the server turn this send down". It decides two separate
+  // consequences - whether the records roll back, and whether the reload, the
+  // reference refresh and the cost line run - and those consequences sat behind
+  // two copies of the same comparison inside one function. A later allowance on
+  // one copy alone (a 3xx, a 204) would roll a send's records back while still
+  // arming a refresh for it, or land them while treating the send as refused.
+  function serverRefused(res) {
+    return !!res && (res.status < 200 || res.status >= 300);
+  }
+
   function hookFetch(scope) {
     var nativeFetch = scope && scope.fetch;
     if (typeof nativeFetch !== 'function') return;
     scope.fetch = function (input, init) {
       var result = null;
       var url = '';
+      // Read before init is replaced below, which is what makes the two bodies
+      // equal from that point on.
+      var touched = false;
       try {
         url = typeof input === 'string' ? input : (input && input.url) || '';
         if (init && typeof init.body === 'string') {
           rememberToken(init.body);
           noteLibraryRpc(url, init.body);
           result = rewrite(url, init.body);
-          if (result.body !== init.body) init = Object.assign({}, init, { body: result.body });
+          touched = result.body !== init.body;
+          if (touched) init = Object.assign({}, init, { body: result.body });
         }
       } catch (e) {
         say('warn', LOG_PRO, 'fetch hook skipped:', e);
@@ -2401,9 +2802,25 @@
       // Nothing on this path traces the stream, so a send is settled on its own
       // response. Only a send: any other fetch resolving first would settle a
       // hold that belongs to the request still in flight.
+      var sent = null;
+      var t0 = 0;
       if (result && url.indexOf('StreamGenerate') !== -1) {
+        // Everything the XHR branch owes a send it is about to make, minus the
+        // stream trace this transport cannot give. The counters have to be
+        // taken here whether or not anything reads them: left where they are,
+        // they describe this send's uploads to whichever plan opens next. And
+        // the cost line is the number every §shape decision is measured
+        // against, so a migration off XHR must not be what silences it.
+        sent = takeWork();
+        t0 = Date.now();
+        keepBody(url, result.body, touched);
+        if (!fetchSendSeen) {
+          fetchSendSeen = true;
+          say('warn', LOG_IMG, 'StreamGenerate went out over fetch — stream tracing does not'
+            + ' cover this transport, timings are per-request only');
+        }
         promise = promise.then(function (res) {
-          if (res && (res.status < 200 || res.status >= 300)) sendFailed('http ' + res.status);
+          if (serverRefused(res)) sendFailed('http ' + res.status);
           else sendLanded();
           return res;
         }, function (err) {
@@ -2414,8 +2831,27 @@
       if (!result) return promise;
       var then = null;
       armSendOutcome(result, null, function (fn) { then = fn; });
-      if (!then) return promise;
-      return promise.then(function (res) { then(); return res; });
+      if (!sent && !then) return promise;
+      return promise.then(function (res) {
+        // A resolved response is not a made turn. Reloading on a refusal
+        // resynchronises the view onto a turn that is not there, and a
+        // reference refresh armed against one can only fail, so a send the
+        // server turned down is owed neither.
+        if (serverRefused(res)) {
+          say('warn', LOG_IMG, 'send: the server refused it, status ' + res.status
+            + ' — no reload and no reference refresh follow');
+          return res;
+        }
+        // Nothing here sees the first byte, so the one span this transport can
+        // report is the whole request.
+        if (sent) {
+          report(sent, 'first byte unavailable on this transport'
+            + ' | total ' + secs(Date.now() - t0));
+        }
+        if (then) then();
+        if (sent) noteGenerationFinished();
+        return res;
+      });
     };
   }
 
@@ -3035,7 +3471,7 @@
   function retryNeedsFresh(p) {
     if (!p.base) return false;
     return p.base.some(function (att) {
-      return isContribTuple(att) && !contribIsOurs(att[0][0]);
+      return attClass(att) === 'contrib-stale';
     });
   }
 
@@ -3089,7 +3525,11 @@
             return freshReady(got.p) || null;
           }, RETRY_UPLOAD_MS, function (ready) {
             if (!ready) {
-              say('warn', LOG_IMG, 'retry: re-upload unfinished, sending what is held');
+              // The deadline expiring is not the whole story: the send goes out
+              // regardless, and what it goes out as is what the user waits for.
+              say('warn', LOG_IMG, 'retry: re-upload unfinished, sending what is held'
+                + ', the send cannot take the fast shape and may carry references '
+                + 'the server no longer honours');
             }
             reportRetryLead(t0);
             pressUpdate(host);
@@ -3229,25 +3669,49 @@
     return w && typeof w.used === 'number' ? w.used : null;
   }
 
+  // Answers whether the payload was recognised. An answer whose shape has
+  // moved parses to an empty object, and an empty object is truthy: adopted, it
+  // would clear the backoff, draw `Current - | Weekly -` for good, and keep
+  // Gemini's own line hidden behind it by the rule that keys off ours being
+  // present - a blank the user cannot tell from a quota the server declines to
+  // report. Nothing is written unless at least one window came back with a
+  // number in it.
   function adoptUsage(payload) {
     var list = Array.isArray(payload) && Array.isArray(payload[1]) ? payload[1] : [];
     var next = {};
+    var readable = 0;
     for (var i = 0; i < list.length; i++) {
       var w = list[i];
       if (!Array.isArray(w)) continue;
       var stamp = Array.isArray(w[3]) && Array.isArray(w[3][0]) ? w[3][0][0] : null;
-      next[w[2]] = {
+      var win = {
         remaining: typeof w[0] === 'number' ? w[0] : null,
         used: typeof w[1] === 'number' ? w[1] : null,
         resetAt: typeof stamp === 'number' ? stamp * 1000 : null
       };
+      if (win.remaining !== null || win.used !== null) readable++;
+      next[w[2]] = win;
     }
+    if (!readable) return false;
     usage.windows = next;
     usage.readAt = Date.now();
     usage.backoff = 0;
     dbg('usage:', partText('current', USAGE_CURRENT), '|', partText('weekly', USAGE_WEEKLY));
     armResetRead();
+    return true;
   }
+
+  // A session that has expired would otherwise be asked on every trigger and
+  // refused every time. Both failures raise it: a read that could not be made
+  // and a read whose answer could not be understood are the same to the next
+  // trigger.
+  function raiseUsageBackoff() {
+    usage.backoff = Math.min(usage.backoff ? usage.backoff * 2 : USAGE_FAIL_MS,
+      USAGE_FAIL_MAX_MS);
+    return Math.round(usage.backoff / 1000) + 's';
+  }
+
+  var usageShapeSeen = false;
 
   // Every trigger comes through here, so the floor between two calls, the one
   // request in flight and the backoff after a failure are stated once. force
@@ -3264,7 +3728,19 @@
     dbg('usage: reading,', reason);
     usage.inFlight = batchExecute(USAGE_RPC, [], 'usage').then(function (payload) {
       usage.inFlight = null;
-      adoptUsage(payload);
+      if (!adoptUsage(payload)) {
+        // The read did not land, so it is treated as one that did not: the
+        // held numbers stay as they are, and with none held the line is never
+        // made and Gemini's own text stays where it is.
+        var again = raiseUsageBackoff();
+        if (!usageShapeSeen) {
+          usageShapeSeen = true;
+          say('warn', LOG_IMG, 'usage payload shape unrecognized, the quota line is left undrawn');
+        }
+        dbg('usage: no window read out of the answer | next read no sooner than', again);
+        schedule();
+        return null;
+      }
       // A scan pass rather than a redraw: the line is made by that pass, and
       // on a page nothing else is mutating there would otherwise be no pass to
       // make it.
@@ -3272,12 +3748,9 @@
       return payload;
     }, function (err) {
       usage.inFlight = null;
-      // A session that has expired would otherwise be asked on every trigger
-      // and refused every time.
-      usage.backoff = Math.min(usage.backoff ? usage.backoff * 2 : USAGE_FAIL_MS,
-        USAGE_FAIL_MAX_MS);
+      var again = raiseUsageBackoff();
       dbg('usage: read failed:', String((err && err.message) || err),
-        '| next read no sooner than', Math.round(usage.backoff / 1000) + 's');
+        '| next read no sooner than', again);
       schedule();
       return null;
     });
@@ -3469,6 +3942,13 @@
   function watchRoute() {
     if (location.pathname === lastPath) return;
     lastPath = location.pathname;
+    // Everything a conversation owns is read here rather than at document
+    // start, where the pathname is /app and belongs to no conversation at all.
+    // The prune is chained rather than fired alongside so it sees the records
+    // this restore has just claimed, and it is what keeps a session that never
+    // reloads from growing the store without bound: persistOverrides writes on
+    // every send, and nothing else checks the budget.
+    restoreOverrides().then(pruneStore);
     if (lastPath.indexOf('/library') !== 0) return;
     // Behind the page's own listing, which is what keeps the replayed template
     // current. Shorter than the wait at boot: by now a template is held - the
@@ -3574,8 +4054,9 @@
   }
 
   renderMenu();
-  restoreOverrides();
-  pruneStore();
+  // The same pair watchRoute runs, for the one case it cannot see: a document
+  // opened straight onto a conversation, where no pathname change follows.
+  restoreOverrides().then(pruneStore);
 
   // Ahead of the application's own listeners, which is the point.
   ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(function (type) {

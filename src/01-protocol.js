@@ -67,7 +67,7 @@
   var WIZ_KEYS = { pctx: 'Ylro7b', pushId: 'qKIAYe', at: 'SNlM0e', bl: 'cfb2h', sid: 'FdrFJe' };
 
   // §config ==================================================================
-  var VERSION = '3.44.0';
+  var VERSION = '3.45.0';
 
   // Gemini keeps its own Update button disabled until the prompt text differs
   // from what the message already holds, so an image-only change cannot be
@@ -245,16 +245,28 @@
     say.apply(null, ['log', LOG_IMG].concat(Array.prototype.slice.call(arguments)));
   }
 
+  // The channel every abandonment reports through. A branch that gives up the
+  // fast shape, throws a dirty plan away or renames a user's file charges the
+  // user something they never asked for - 55s, or a file name the server then
+  // keeps - and dbg() is off by default, so a branch that reports only there
+  // reports to nobody. Both halves are the point: `what` is the cost paid,
+  // `why` is the condition that failed, and a report missing either one leaves
+  // the next reader guessing which of the two it was.
+  function reportDowngrade(what, why) {
+    say('warn', LOG_IMG, 'degraded: ' + what + ' — ' + why);
+  }
+
   // Reads an attachment list as `kind[length]:name`, which is enough to tell at
-  // a glance whether a send is in the shape §shape is aiming for.
+  // a glance whether a send is in the shape §shape is aiming for. The kind is
+  // asked of attClass in §upload, the same call the gates make, so the line
+  // printed here cannot say a list was contrib while the gate that read it saw
+  // otherwise. attClass is declared further down the concatenated file, which
+  // is safe: function declarations hoist over the whole shared scope.
   function attShape(list) {
     if (!Array.isArray(list)) return String(list);
     return list.map(function (a) {
       if (!Array.isArray(a)) return '?';
-      var head = a[0] && a[0][0];
-      var kind = typeof head === 'string' && head.indexOf(CONTRIB_PREFIX) === 0
-        ? 'contrib' : (a.length >= 3 && typeof a[2] === 'string' ? 'token' : 'other');
-      return kind + '[' + a.length + ']:' + a[1];
+      return attClass(a) + '[' + a.length + ']:' + a[1];
     }).join(', ');
   }
 
@@ -423,9 +435,24 @@
   // An answer can carry more than one envelope: a generation is streamed as a
   // run of them, and which one holds the finished turn is not fixed, so every
   // one of them is handed back rather than the first.
+  // The first drop of each rpc is worth a line; the rest are not. A generation
+  // is streamed as a run of envelopes, so an answer that routinely carries one
+  // odd chunk would print a line per turn on a channel that is never off.
+  var wrbDropSeen = {};
+
+  function noteWrbDrops(rpcId, dropped, chars) {
+    var key = rpcId || 'ProcessFile';
+    var line = key + ': ' + dropped + ' envelope(s) unreadable and dropped (response '
+      + chars + ' chars)';
+    if (wrbDropSeen[key]) { dbg('wrb: ' + line); return; }
+    wrbDropSeen[key] = true;
+    say('warn', LOG_IMG, line);
+  }
+
   function wrbPayloads(text, rpcId) {
     var head = '[["wrb.fr",' + (rpcId ? '"' + rpcId + '"' : 'null') + ',"';
     var out = [];
+    var dropped = 0;
     var at = text.indexOf(head);
     while (at !== -1) {
       // The payload is a JSON string inside the envelope, so it ends at the
@@ -439,10 +466,15 @@
       try {
         out.push(JSON.parse(JSON.parse('"' + text.slice(from, to) + '"')));
       } catch (e) {
-        // A chunk that does not parse teaches nothing; the next one may.
+        // A chunk that does not parse teaches nothing; the next one may. It is
+        // still counted: five subsystems read the length of this array, and to
+        // every one of them a response of three envelopes and one of six with
+        // three unreadable look exactly alike.
+        dropped++;
       }
       at = text.indexOf(head, to);
     }
+    if (dropped) noteWrbDrops(rpcId, dropped, text.length);
     return out;
   }
 
@@ -468,9 +500,17 @@
     return 'f.req=' + encodeURIComponent(freq) + '&at=' + encodeURIComponent(at) + '&';
   }
 
+  // The same figure §library's gmGet is given, for the same reason: generous
+  // against the megabytes a conversation load answers with on a slow line, and
+  // far short of the forever a missing deadline means. Forever is not an
+  // abstraction here - a request that never settles holds §usage's inFlight and
+  // §origins' harvesting flag for the life of the document, and every trigger
+  // that would have reset them is refused while they are held.
+  var RPC_TIMEOUT_MS = 90000;
+
   function rpcPost(url, freq, rpcId, label) {
     var doneFetch = dbgT((label || rpcId || 'rpc') + ': rpc round-trip');
-    return fetch(url, {
+    var request = fetch(url, {
       method: 'POST',
       credentials: 'include',
       headers: {
@@ -479,10 +519,34 @@
       },
       body: rpcBody(freq)
     }).then(function (res) {
-      return res.text();
+      return res.text().then(function (text) {
+        // A refusal and a verification page both answer a body holding no
+        // envelope at all, and 'no <rpcid> payload' names neither which of the
+        // two it was nor that the server said anything about it. The status is
+        // the whole of that answer, so it is not thrown away here.
+        if (!res.ok) {
+          throw new Error((rpcId || 'ProcessFile') + ' answered http ' + res.status
+            + ' (' + text.length + ' chars)');
+        }
+        return text;
+      });
     }).then(function (text) {
       doneFetch(text.length, 'chars');
       return wrbPayload(text, rpcId);
+    });
+    var timer = null;
+    var deadline = new Promise(function (resolve, reject) {
+      timer = setTimeout(function () {
+        reject(new Error((rpcId || 'ProcessFile') + ' did not answer within '
+          + (RPC_TIMEOUT_MS / 1000) + 's'));
+      }, RPC_TIMEOUT_MS);
+    });
+    return Promise.race([request, deadline]).then(function (payload) {
+      clearTimeout(timer);
+      return payload;
+    }, function (err) {
+      clearTimeout(timer);
+      throw err;
     });
   }
 

@@ -1,4 +1,26 @@
   // §resend ==================================================================
+  // A send this script declines to write, on a message whose resend still
+  // discards every turn after it. The list goes out as the page built it; the
+  // records for the discarded turns go with them either way, so the commit is
+  // owed whether or not anything was written. Leaving before it is what left
+  // them behind as orphans for syncOverrides to draw over unrelated messages.
+  //
+  // Only when the send really is the resend: a plan left idling while the user
+  // types into the composer would otherwise arm a truncation hold against a
+  // message that send never touched.
+  function backOut(inner, p, why) {
+    if (!isEditResend(inner)) {
+      dbg('editorContribution: backing out -', why, '- and this send is not the resend');
+      return null;
+    }
+    reportDowngrade('the attachment list goes out as the page built it, and the turns after '
+      + 'this message are discarded with their records', why);
+    commitSend(p, inner[PROMPT_TUPLE][ATTACHMENTS], false);
+    plan = null;
+    teardownEditorUi();
+    return null;
+  }
+
   function editorContribution(inner) {
     if (!imageEditor) return null;
     var p = activePlan();
@@ -25,9 +47,7 @@
       // the retry reuses it: an entry whose upload failed has no attachment to
       // write, and applyPlanTo dereferenced it.
       if (!planIsReady(p)) {
-        say('warn', LOG_IMG, 'retry: an upload on the plan for this message never '
-          + 'finished, attachments left untouched');
-        return null;
+        return backOut(inner, p, 'an upload on the plan for this message never finished');
       }
       var kept = applyPlanTo(inner, p, false);
       // The same reading of that return as the route below: null means this
@@ -42,17 +62,46 @@
     }
     // An unchanged list still has to be written when the message carries a
     // record, because the body Gemini builds is the one from before the resend
-    // that produced it.
-    if (!dirty && !p.base) return null;
-    if (dirty && !planIsReady(p)) {
-      say('warn', LOG_IMG, 'an upload has not finished, attachments left untouched');
+    // that produced it. With no record and no change there is no list worth
+    // writing - but the send is still a resend of an edited message, the server
+    // still discards every turn after it, and the records for those turns still
+    // have to go with them. Leaving before the commit is what left them behind
+    // as orphans for syncOverrides to draw over unrelated messages.
+    //
+    // Only for a send that is actually the resend, though: a plan left idling
+    // while the user types into the composer would otherwise arm a truncation
+    // hold against a message that send never touched.
+    if (!dirty && !p.base) {
+      if (!isEditResend(inner)) {
+        dbg('editorContribution: nothing staged and no record, and this send is not the resend');
+        return null;
+      }
+      dbg('editorContribution: nothing to write, the body goes as it stands and the record is held');
+      commitSend(p, inner[PROMPT_TUPLE][ATTACHMENTS], false);
+      plan = null;
+      teardownEditorUi();
       return null;
+    }
+    if (dirty && !planIsReady(p)) {
+      return backOut(inner, p, 'an upload staged in this edit has not finished');
     }
 
     var hasNew = p.entries.some(function (entry) { return entry.kind === 'new'; });
     var fresh = freshReady(p);
     if (!fresh) {
       dbg('editorContribution: re-uploads not finished, the record\'s own references are sent');
+      // Naming the entries, because the two ways to arrive here want opposite
+      // things from the user: an upload still running means the next send of
+      // the same message is fast, one that failed means this plan never will
+      // be and the image wants replacing by hand.
+      reportDowngrade('re-uploads unfinished, the record\'s own references are sent '
+        + 'instead (measured 79.9s vs 24.2s)',
+        p.entries.filter(function (entry) {
+          return entry.kind === 'existing' && !entry.freshAttachment;
+        }).map(function (entry) {
+          return 'existing#' + entry.index + ' '
+            + (entry.freshError ? 'failed: ' + entry.freshError : 'still uploading');
+        }).join(', '));
     }
 
     var listWritten = applyPlanTo(inner, p, fresh);
@@ -96,15 +145,22 @@
     // to discard. §store resolves the hold on the send's outcome, and the
     // record written below is restored to what it was if that outcome is a
     // failure. Unconditional, and ahead of the verdict below: a send that
-    // backed out of the list is still a resend.
-    holdSend(p.index);
+    // backed out of the list, or never had one to write, is still a resend and
+    // the server truncates behind it just the same.
+    // The conversation goes with it. §store resolves the hold when the
+    // response lands, which is long enough for a route change to have made the
+    // pathname on screen someone else's.
+    // Refusing to hold and refusing to write are one decision: without a hold
+    // there is no ordinal this send's outcome can be resolved against, and a
+    // record written at that same ordinal is one nothing will ever put back.
+    if (!holdSend(p.index, location.pathname)) return false;
 
-    // applyPlanTo backed out, so the only list to hand is the one the page
-    // built, which need not be as long as the thumbs and blobs beside it. A
-    // record whose three arrays disagree is worse than the one already on file:
-    // prunable() requires thumbs and blobs to match, nameFor() indexes
-    // attachments by the thumb's index, and refreshOverride() counts one array
-    // and names the other.
+    // Either applyPlanTo backed out or there was never a list to write, so the
+    // only one to hand is the one the page built, which need not be as long as
+    // the thumbs and blobs beside it. A record whose three arrays disagree is
+    // worse than the one already on file: prunable() requires thumbs and blobs
+    // to match, nameFor() indexes attachments by the thumb's index, and
+    // refreshOverride() counts one array and names the other.
     if (!listWritten) {
       dbg('commitSend: the list was not written, the record is left as it stands');
       return false;
@@ -131,7 +187,19 @@
     // here as well would state the same rule in a second place, and only one of
     // the two would be reached.
     if (stored) {
-      pendingRefresh = { index: p.index };
+      // Everything the upgrade will be aimed by, read here rather than there.
+      // It runs 800ms after the response at the earliest, by which time the
+      // pathname is whatever the user routed to and the record at this ordinal
+      // may belong to a later send; the generation is the one installOverride
+      // has just written, and it is what tells that later send's record from
+      // this one when both are the same object.
+      var justStored = overrideAt(p.index);
+      pendingRefresh = {
+        index: p.index,
+        path: location.pathname,
+        conv: conversationId(),
+        gen: justStored ? justStored.gen : 0
+      };
     }
     // Reloading is the fallback for a record that could not be kept: without
     // one, the message on screen is the one from before this send.
@@ -404,7 +472,9 @@
       whenDone(function () {
         // After the stream closes the turn is on the server, so its durable
         // references can be fetched; the delay leaves room for the commit.
-        setTimeout(function () { refreshOverride(refresh.index, 0); }, 800);
+        setTimeout(function () {
+          refreshOverride(refresh.index, 0, refresh.conv, refresh.path, refresh.gen);
+        }, 800);
       });
     }
   }
@@ -462,19 +532,35 @@
   // nothing at all. `@sandbox raw` in the header settles it - the two windows
   // are one - and both are still patched so a manager that ignores the
   // directive is covered.
+  var fetchSendSeen = false;
+
+  // One owner for "did the server turn this send down". It decides two separate
+  // consequences - whether the records roll back, and whether the reload, the
+  // reference refresh and the cost line run - and those consequences sat behind
+  // two copies of the same comparison inside one function. A later allowance on
+  // one copy alone (a 3xx, a 204) would roll a send's records back while still
+  // arming a refresh for it, or land them while treating the send as refused.
+  function serverRefused(res) {
+    return !!res && (res.status < 200 || res.status >= 300);
+  }
+
   function hookFetch(scope) {
     var nativeFetch = scope && scope.fetch;
     if (typeof nativeFetch !== 'function') return;
     scope.fetch = function (input, init) {
       var result = null;
       var url = '';
+      // Read before init is replaced below, which is what makes the two bodies
+      // equal from that point on.
+      var touched = false;
       try {
         url = typeof input === 'string' ? input : (input && input.url) || '';
         if (init && typeof init.body === 'string') {
           rememberToken(init.body);
           noteLibraryRpc(url, init.body);
           result = rewrite(url, init.body);
-          if (result.body !== init.body) init = Object.assign({}, init, { body: result.body });
+          touched = result.body !== init.body;
+          if (touched) init = Object.assign({}, init, { body: result.body });
         }
       } catch (e) {
         say('warn', LOG_PRO, 'fetch hook skipped:', e);
@@ -483,9 +569,25 @@
       // Nothing on this path traces the stream, so a send is settled on its own
       // response. Only a send: any other fetch resolving first would settle a
       // hold that belongs to the request still in flight.
+      var sent = null;
+      var t0 = 0;
       if (result && url.indexOf('StreamGenerate') !== -1) {
+        // Everything the XHR branch owes a send it is about to make, minus the
+        // stream trace this transport cannot give. The counters have to be
+        // taken here whether or not anything reads them: left where they are,
+        // they describe this send's uploads to whichever plan opens next. And
+        // the cost line is the number every §shape decision is measured
+        // against, so a migration off XHR must not be what silences it.
+        sent = takeWork();
+        t0 = Date.now();
+        keepBody(url, result.body, touched);
+        if (!fetchSendSeen) {
+          fetchSendSeen = true;
+          say('warn', LOG_IMG, 'StreamGenerate went out over fetch — stream tracing does not'
+            + ' cover this transport, timings are per-request only');
+        }
         promise = promise.then(function (res) {
-          if (res && (res.status < 200 || res.status >= 300)) sendFailed('http ' + res.status);
+          if (serverRefused(res)) sendFailed('http ' + res.status);
           else sendLanded();
           return res;
         }, function (err) {
@@ -496,8 +598,27 @@
       if (!result) return promise;
       var then = null;
       armSendOutcome(result, null, function (fn) { then = fn; });
-      if (!then) return promise;
-      return promise.then(function (res) { then(); return res; });
+      if (!sent && !then) return promise;
+      return promise.then(function (res) {
+        // A resolved response is not a made turn. Reloading on a refusal
+        // resynchronises the view onto a turn that is not there, and a
+        // reference refresh armed against one can only fail, so a send the
+        // server turned down is owed neither.
+        if (serverRefused(res)) {
+          say('warn', LOG_IMG, 'send: the server refused it, status ' + res.status
+            + ' — no reload and no reference refresh follow');
+          return res;
+        }
+        // Nothing here sees the first byte, so the one span this transport can
+        // report is the whole request.
+        if (sent) {
+          report(sent, 'first byte unavailable on this transport'
+            + ' | total ' + secs(Date.now() - t0));
+        }
+        if (then) then();
+        if (sent) noteGenerationFinished();
+        return res;
+      });
     };
   }
 

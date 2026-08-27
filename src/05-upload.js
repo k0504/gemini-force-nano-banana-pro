@@ -25,6 +25,24 @@
       && t[0][0].indexOf(CONTRIB_PREFIX) === 0;
   }
 
+  // The only answer to "what is this attachment". The question used to be asked
+  // in four places that disagreed: §shape gated on the prefix alone, so a
+  // contrib minted by a dead document passed; §freshen and §retry each asked
+  // the prefix and the mint separately; and the console label asked the prefix
+  // without even the Array.isArray guard. A line an operator read could
+  // therefore contradict the gate that made the decision, which is how a live
+  // fix read as a reverted one. Both predicates above stay private to this file
+  // so the disagreement cannot come back.
+  //   contrib-live   this document minted it and is still inside CONTRIB_TTL_MS
+  //   contrib-stale  a contrib path, but not one this document can vouch for
+  //   token          the server reference §refresh writes back into a record
+  //   other          anything else, a native prompt tuple included
+  function attClass(t) {
+    if (isContribTuple(t)) return contribIsOurs(t[0][0]) ? 'contrib-live' : 'contrib-stale';
+    if (Array.isArray(t) && t.length >= 3 && typeof t[2] === 'string') return 'token';
+    return 'other';
+  }
+
   function uploadFile(file) {
     var mime = file.type || 'image/jpeg';
     var startHeaders = {

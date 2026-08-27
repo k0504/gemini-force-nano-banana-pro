@@ -120,7 +120,7 @@
   function retryNeedsFresh(p) {
     if (!p.base) return false;
     return p.base.some(function (att) {
-      return isContribTuple(att) && !contribIsOurs(att[0][0]);
+      return attClass(att) === 'contrib-stale';
     });
   }
 
@@ -174,7 +174,11 @@
             return freshReady(got.p) || null;
           }, RETRY_UPLOAD_MS, function (ready) {
             if (!ready) {
-              say('warn', LOG_IMG, 'retry: re-upload unfinished, sending what is held');
+              // The deadline expiring is not the whole story: the send goes out
+              // regardless, and what it goes out as is what the user waits for.
+              say('warn', LOG_IMG, 'retry: re-upload unfinished, sending what is held'
+                + ', the send cannot take the fast shape and may carry references '
+                + 'the server no longer honours');
             }
             reportRetryLead(t0);
             pressUpdate(host);

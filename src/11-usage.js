@@ -35,25 +35,49 @@
     return w && typeof w.used === 'number' ? w.used : null;
   }
 
+  // Answers whether the payload was recognised. An answer whose shape has
+  // moved parses to an empty object, and an empty object is truthy: adopted, it
+  // would clear the backoff, draw `Current - | Weekly -` for good, and keep
+  // Gemini's own line hidden behind it by the rule that keys off ours being
+  // present - a blank the user cannot tell from a quota the server declines to
+  // report. Nothing is written unless at least one window came back with a
+  // number in it.
   function adoptUsage(payload) {
     var list = Array.isArray(payload) && Array.isArray(payload[1]) ? payload[1] : [];
     var next = {};
+    var readable = 0;
     for (var i = 0; i < list.length; i++) {
       var w = list[i];
       if (!Array.isArray(w)) continue;
       var stamp = Array.isArray(w[3]) && Array.isArray(w[3][0]) ? w[3][0][0] : null;
-      next[w[2]] = {
+      var win = {
         remaining: typeof w[0] === 'number' ? w[0] : null,
         used: typeof w[1] === 'number' ? w[1] : null,
         resetAt: typeof stamp === 'number' ? stamp * 1000 : null
       };
+      if (win.remaining !== null || win.used !== null) readable++;
+      next[w[2]] = win;
     }
+    if (!readable) return false;
     usage.windows = next;
     usage.readAt = Date.now();
     usage.backoff = 0;
     dbg('usage:', partText('current', USAGE_CURRENT), '|', partText('weekly', USAGE_WEEKLY));
     armResetRead();
+    return true;
   }
+
+  // A session that has expired would otherwise be asked on every trigger and
+  // refused every time. Both failures raise it: a read that could not be made
+  // and a read whose answer could not be understood are the same to the next
+  // trigger.
+  function raiseUsageBackoff() {
+    usage.backoff = Math.min(usage.backoff ? usage.backoff * 2 : USAGE_FAIL_MS,
+      USAGE_FAIL_MAX_MS);
+    return Math.round(usage.backoff / 1000) + 's';
+  }
+
+  var usageShapeSeen = false;
 
   // Every trigger comes through here, so the floor between two calls, the one
   // request in flight and the backoff after a failure are stated once. force
@@ -70,7 +94,19 @@
     dbg('usage: reading,', reason);
     usage.inFlight = batchExecute(USAGE_RPC, [], 'usage').then(function (payload) {
       usage.inFlight = null;
-      adoptUsage(payload);
+      if (!adoptUsage(payload)) {
+        // The read did not land, so it is treated as one that did not: the
+        // held numbers stay as they are, and with none held the line is never
+        // made and Gemini's own text stays where it is.
+        var again = raiseUsageBackoff();
+        if (!usageShapeSeen) {
+          usageShapeSeen = true;
+          say('warn', LOG_IMG, 'usage payload shape unrecognized, the quota line is left undrawn');
+        }
+        dbg('usage: no window read out of the answer | next read no sooner than', again);
+        schedule();
+        return null;
+      }
       // A scan pass rather than a redraw: the line is made by that pass, and
       // on a page nothing else is mutating there would otherwise be no pass to
       // make it.
@@ -78,12 +114,9 @@
       return payload;
     }, function (err) {
       usage.inFlight = null;
-      // A session that has expired would otherwise be asked on every trigger
-      // and refused every time.
-      usage.backoff = Math.min(usage.backoff ? usage.backoff * 2 : USAGE_FAIL_MS,
-        USAGE_FAIL_MAX_MS);
+      var again = raiseUsageBackoff();
       dbg('usage: read failed:', String((err && err.message) || err),
-        '| next read no sooner than', Math.round(usage.backoff / 1000) + 's');
+        '| next read no sooner than', again);
       schedule();
       return null;
     });

@@ -31,6 +31,12 @@
       host: host,
       container: container,
       index: index,
+      // Which conversation this plan's entries came from. The name lookup it
+      // arms below resolves an rpc later, and asking the location by then
+      // answered whichever thread the user had routed to: a name map from
+      // another conversation misses every thumbnail, and a miss is a permanent
+      // rename to image-<n>.jpg.
+      conv: conversationId(),
       base: base,
       baseBlobs: baseBlobs,
       originalCount: thumbs.length,
@@ -79,6 +85,17 @@
   function activePlan() {
     if (!plan) return null;
     if (plan.armedAt !== null && Date.now() - plan.armedAt > PLAN_TTL_MS) {
+      // A dirty plan that expires takes the user's edit with it, and the send
+      // that reads this getter a moment later goes out without it, so the loss
+      // is reported. A clean one is the ordinary editor closed with Escape:
+      // nothing was staged, the next send is usually an unrelated composer
+      // message, and a warning there would name a loss that never happened.
+      if (planIsDirty(plan)) {
+        reportDowngrade('edit plan expired unsent, its changes are dropped',
+          'message #' + plan.index);
+      } else {
+        dbg('activePlan: plan #' + plan.index + ' expired unsent with nothing staged');
+      }
       plan = null;
       return null;
     }
@@ -188,7 +205,7 @@
       return typeof entry.thumb === 'string' && entry.thumb.indexOf('http') === 0;
     });
     if (!reachable) return null;
-    p.names = namesByThumb().catch(function (err) {
+    p.names = namesByThumb(p.conv).catch(function (err) {
       dbg('planNames: names unavailable, falling back to image-<n>.jpg (' + err + ')');
       return null;
     });
@@ -199,11 +216,25 @@
     var known = p.base && p.base[entry.index];
     if (known && typeof known[1] === 'string' && known[1]) return Promise.resolve(known[1]);
     var pending = planNames(p);
-    if (!pending) return Promise.resolve(fallbackName(entry.index));
+    // The only branch in this file whose cost is not time. The name handed to
+    // the upload becomes the name the resent message carries, so falling back
+    // here renames the user's file to image-<n>.jpg on the server for good -
+    // there is no later pass that puts the original back.
+    if (!pending) {
+      reportDowngrade('original file name lost for existing#' + entry.index
+        + ', re-uploading as ' + fallbackName(entry.index)
+        + ' — the server keeps that name permanently',
+        'no record name and no server name for this thumbnail');
+      return Promise.resolve(fallbackName(entry.index));
+    }
     return pending.then(function (byThumb) {
       var found = byThumb && byThumb[thumbKey(entry.thumb)];
       if (!found) {
         dbg('freshen: existing#' + entry.index, 'the server reports no name for this thumbnail');
+        reportDowngrade('original file name lost for existing#' + entry.index
+          + ', re-uploading as ' + fallbackName(entry.index)
+          + ' — the server keeps that name permanently',
+          'no record name and no server name for this thumbnail');
       }
       return found || fallbackName(entry.index);
     });
@@ -218,6 +249,10 @@
         dbg('freshen: existing#' + entry.index, 'fresh contrib ready');
       }).catch(function (err) {
         entry.freshPending = false;
+        // Kept so the send that gives up on this entry can say which of the two
+        // it is looking at: an upload still running is worth waiting for, one
+        // that failed never becomes fast and the wait is spent for nothing.
+        entry.freshError = String(err);
         say('warn', LOG_IMG, 'freshen failed for existing#' + entry.index + ':', err);
       });
   }
@@ -234,7 +269,7 @@
         // already the shape the send wants, so uploading over it buys nothing
         // and costs a round trip per image on every edit - which is now every
         // edit, since this runs unconditionally.
-        if (isContribTuple(known) && contribIsOurs(known[0][0])) {
+        if (attClass(known) === 'contrib-live') {
           entry.freshAttachment = known;
           dbg('freshen: existing#' + entry.index, 'contrib from this document, reused as-is');
           return null;
@@ -252,6 +287,7 @@
         });
       }).catch(function (err) {
         entry.freshPending = false;
+        entry.freshError = String(err);
         say('warn', LOG_IMG, 'freshen failed for existing#' + entry.index + ':', err);
       });
     });
@@ -264,27 +300,32 @@
   }
 
   // §apply ===================================================================
-  // Writes the plan into the outgoing prompt tuple. Returns whether the
-  // attachment list was written, or null when neither it nor the sentinel
-  // needed touching.
+  // Whether the send being built is the resend of an edited message. Asked in
+  // two places - before the list is written, and by the §resend route that owes
+  // the record a truncation hold even when it has no list to write - so the
+  // comparison itself lives in one, and the two cannot drift into disagreeing
+  // about which sends a plan speaks for.
+  function isEditResend(inner) {
+    return inner[ACTION_INDEX] === ACTION_EDIT_RESEND;
+  }
+
+  // Writes the plan into the outgoing prompt tuple. null means only that this
+  // send is not the one the plan was made for; true that the attachment list
+  // was written, false that it was backed out of - a send that is still an edit
+  // resend, and still owes the record everything §commit gives one.
+  //
+  // The sentinel is not this function's to strip. rewrite() takes it off every
+  // send that carries it, plan or no plan, which is the only rule that also
+  // covers the retry of a message with no attachments; a second strip here
+  // could only ever find nothing and read as though it were doing the work.
   function applyPlanTo(inner, p, fresh) {
-    if (inner[ACTION_INDEX] !== ACTION_EDIT_RESEND) {
+    if (!isEditResend(inner)) {
       dbg('applyPlanTo: action is', JSON.stringify(inner[ACTION_INDEX]), '(not edit resend 2), skip');
       return null;
     }
 
     var tuple = inner[PROMPT_TUPLE];
-    var textChanged = false;
     var listWritten = false;
-
-    // The sentinel is ours and must never reach the server. It is stripped
-    // before the attachment rewrite so that it still goes when that backs out.
-    if (p.sentinelApplied && typeof tuple[PROMPT_TEXT] === 'string'
-      && tuple[PROMPT_TEXT].indexOf(SENTINEL) !== -1) {
-      tuple[PROMPT_TEXT] = tuple[PROMPT_TEXT].split(SENTINEL).join('');
-      textChanged = true;
-      dbg('applyPlanTo: sentinel stripped from prompt text');
-    }
 
     // The body's own list is what this message holds only while it has never
     // been resent; after that the record is, and the body carries the stale one.
@@ -323,7 +364,6 @@
       dbg('applyPlanTo: wrote', attShape(tuple[ATTACHMENTS]));
     }
 
-    if (!textChanged && !listWritten) return null;
     return listWritten;
   }
 
@@ -359,17 +399,24 @@
   // 2.0s to first byte, against 21.3s for the same send with it left in.
   function chooseSendShape(inner, written, hasNew) {
     var allContrib = Array.isArray(written) && written.length > 0
-      && written.every(isContribTuple);
+      && written.every(function (att) { return attClass(att) === 'contrib-live'; });
     work.images = Array.isArray(written) ? written.length : 0;
     work.shape = allContrib ? 'brand-new upload shape' : 'edit resend';
 
     if (!allContrib) {
-      // Something in the list is still a server reference, so the send cannot
-      // take the shape above and goes out as the edit resend it is. Clearing
-      // the action alone is still worth it when an upload is present, that
-      // combination being the slowest thing the server answers.
+      // Something in the list is a server reference, or a contrib this document
+      // cannot vouch for, so the send cannot take the shape above and goes out
+      // as the edit resend it is. Clearing the action alone is still worth it
+      // when an upload is present, that combination being the slowest thing the
+      // server answers.
       if (hasNew) inner[ACTION_INDEX] = null;
-      dbg('chooseSendShape: list is not all contribs, sent as an edit resend');
+      dbg('chooseSendShape: not every attachment is contrib-live, sent as an edit resend |',
+        attShape(written));
+      // The timing table above is what the user is paying here, so it is quoted
+      // rather than described: this is the one decision in the send path whose
+      // cost is a minute of waiting the user cannot account for otherwise.
+      reportDowngrade('brand-new upload shape abandoned, sent as edit resend '
+        + '(measured 79.9s vs 24.2s)', attShape(written));
       return;
     }
 

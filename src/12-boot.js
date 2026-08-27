@@ -7,6 +7,13 @@
   function watchRoute() {
     if (location.pathname === lastPath) return;
     lastPath = location.pathname;
+    // Everything a conversation owns is read here rather than at document
+    // start, where the pathname is /app and belongs to no conversation at all.
+    // The prune is chained rather than fired alongside so it sees the records
+    // this restore has just claimed, and it is what keeps a session that never
+    // reloads from growing the store without bound: persistOverrides writes on
+    // every send, and nothing else checks the budget.
+    restoreOverrides().then(pruneStore);
     if (lastPath.indexOf('/library') !== 0) return;
     // Behind the page's own listing, which is what keeps the replayed template
     // current. Shorter than the wait at boot: by now a template is held - the
@@ -112,8 +119,9 @@
   }
 
   renderMenu();
-  restoreOverrides();
-  pruneStore();
+  // The same pair watchRoute runs, for the one case it cannot see: a document
+  // opened straight onto a conversation, where no pathname change follows.
+  restoreOverrides().then(pruneStore);
 
   // Ahead of the application's own listeners, which is the point.
   ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(function (type) {

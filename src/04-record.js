@@ -120,35 +120,79 @@
   // The only caller is commitSend, so this covers the resends this script
   // commits. A resend that never reaches it leaves its later records behind for
   // the budget: a retry of a message with no attachments arms no plan at all,
-  // and an unchanged list on a message with no record exits before the commit.
-  // Both are sends this script has nothing to write for, which is why neither
-  // has an index to drop from.
+  // so there is no message index to drop from. An edit that changes only the
+  // text of a message with no record does reach the commit - it writes no list,
+  // but the server truncates behind it, and leaving before the hold was armed
+  // is what left those turns' records behind as orphans.
   // The drop and the snapshot below are what makes a send reversible. Both
   // used to run while the request body was still being built, so a send that
   // never reached the server - a dropped connection, a tab closed mid-flight -
   // deleted the records of turns the server never truncated and left the record
   // for this message claiming a list that was never sent.
   var heldDrop = null;
+  var heldPath = null;
   var heldRecord = null;
 
-  function holdSend(index) {
+  // The conversation is pinned when the hold is armed rather than read again
+  // when the send settles. A send that lands after the user has routed away
+  // still truncated the conversation it was made in, and the records it owes
+  // are that conversation's; resolving against whatever is on screen by then
+  // either spares those orphans or takes another thread's records instead.
+  function holdSend(index, path) {
+    // -1 is indexOfHost saying the message has already left the tree, and
+    // dropRecordsAfter(-1) would take every record in the conversation with
+    // it. Nothing is held - including anything an earlier send left held,
+    // which this send's outcome would otherwise resolve against an ordinal
+    // that is not its own.
+    if (typeof index !== 'number' || index < 0) {
+      say('warn', LOG_IMG, 'send held with no message index, records left untouched');
+      heldDrop = null;
+      heldPath = null;
+      heldRecord = null;
+      // Said out loud, because the caller went on to write a record at that
+      // same index and the warning above then described the opposite of what
+      // happened. Refusing to hold and refusing to write are one decision.
+      return false;
+    }
     heldDrop = index;
+    heldPath = path;
     heldRecord = snapshotOverride(index);
+    return true;
   }
 
   function sendLanded() {
     var index = heldDrop;
+    var path = heldPath;
     heldDrop = null;
+    heldPath = null;
     heldRecord = null;
     if (index === null) return;
-    dropRecordsAfter(index);
+    // Against the pinned conversation, wherever the user is by now: the server
+    // truncated that one, so its later records describe turns that no longer
+    // exist whether or not it is still the conversation on screen.
+    dropRecordsAfter(index, path);
   }
 
   function sendFailed(why) {
     if (heldDrop === null) return;
     var snap = heldRecord;
+    var index = heldDrop;
+    var path = heldPath;
     heldDrop = null;
+    heldPath = null;
     heldRecord = null;
+    // The rollback is the half that cannot be done from a pinned path:
+    // restoreOverride finds its record through overrideAt and keys its delete
+    // by the pathname on screen, both of which describe the conversation being
+    // looked at. Rather than write this conversation's record from another
+    // one's snapshot, the hold is resolved and what it cost is named.
+    if (path !== location.pathname) {
+      reportDowngrade('the record for message #' + index + ' is left as the send wrote it '
+        + 'rather than put back',
+        'the send did not go out (' + why + ') and the page moved from ' + path
+        + ' to ' + location.pathname + ' before the rollback could run');
+      return;
+    }
     say('warn', LOG_IMG, 'the send did not go out (' + why + '); the later records are kept '
       + 'and the record for this message is put back as it was');
     restoreOverride(snap);
@@ -189,9 +233,13 @@
     persistOverrides();
   }
 
-  function dropRecordsAfter(index) {
+  // The conversation is passed in, never read off the location: this runs when
+  // the send lands, which can be long after the user has routed elsewhere. The
+  // stored keys are built from the doomed rows themselves, so they were never
+  // wrong; the filter that chose those rows was.
+  function dropRecordsAfter(index, path) {
     var doomed = overrides.filter(function (o) {
-      return o.path === location.pathname && o.index > index;
+      return o.path === path && o.index > index;
     });
     if (!doomed.length) return;
     doomed.forEach(function (o) {
@@ -200,7 +248,7 @@
       overrides.splice(overrides.indexOf(o), 1);
     });
     var keys = doomed.map(function (o) { return o.path + '#' + o.index; });
-    dbg('dropRecordsAfter: message #' + index + ' resent,', keys.length,
+    dbg('dropRecordsAfter: message #' + index + ' of ' + path + ' resent,', keys.length,
       'later records discarded with it');
     dbDelete(RECORDS, keys).catch(function (err) {
       say('warn', LOG_IMG, 'could not discard the records after #' + index + ':', err);
@@ -230,6 +278,14 @@
     return n;
   }
 
+  // Which conversations the in-memory array is still carrying. Asked instead of
+  // the pathname on screen because the pathname is only true for the instant it
+  // is read: this runs from a route change, and every conversation visited
+  // since the document opened still holds its bytes here.
+  function pathHeldInMemory(path) {
+    return overrides.some(function (o) { return o.path === path; });
+  }
+
   function pruneStore() {
     return dbReadAll(RECORDS).then(function (rows) {
       var held = 0;
@@ -238,10 +294,11 @@
         dbg('pruneStore:', (held / 1048576).toFixed(1) + 'MB held, within the budget');
         return null;
       }
-      // The conversation on screen is never a candidate: its bytes are held in
-      // memory as well, so the next send would write them straight back.
+      // A conversation this document has open is never a candidate: its bytes
+      // are held in memory as well, so the next send would write them straight
+      // back.
       var evictable = rows.filter(function (r) {
-        return prunable(r) && r.path !== location.pathname;
+        return prunable(r) && !pathHeldInMemory(r.path);
       }).sort(function (a, b) { return (a.savedAt || 0) - (b.savedAt || 0); });
 
       var freed = 0;
@@ -321,13 +378,28 @@
     return o && Array.isArray(o.blobs) ? o.blobs.slice() : null;
   }
 
-  function overrideAt(index) {
+  function overrideAtPath(index, path) {
     for (var i = 0; i < overrides.length; i++) {
-      if (overrides[i].index === index && overrides[i].path === location.pathname) {
+      if (overrides[i].index === index && overrides[i].path === path) {
         return overrides[i];
       }
     }
     return null;
+  }
+
+  function overrideAt(index) {
+    return overrideAtPath(index, location.pathname);
+  }
+
+  // One counter for every record this document writes, rather than a count
+  // kept per record. A per-record count starts at 1 for each of them, so two
+  // records - one per conversation - read as the same generation, and a guard
+  // comparing them lets exactly the mix-up it was written to stop straight
+  // through. Monotonic here means a generation names one record's one state.
+  var recordGen = 0;
+  function nextGen() {
+    recordGen += 1;
+    return recordGen;
   }
 
   // A thumbnail replaced is a thumbnail nothing can reach: a blob: URL pins its
@@ -360,6 +432,13 @@
       existing.thumbs = thumbs;
       existing.attachments = attachments;
       existing.blobs = blobs || [];
+      // A record is rewritten in place, so a deferred write holding this
+      // object still holds the right object while its content has become
+      // another send's. The counter is the only thing that tells those two
+      // apart: a write armed against generation 3 refuses a record that has
+      // since become 4. It is not persisted, because a record read back from
+      // the store has no deferred write waiting on it.
+      existing.gen = nextGen();
       dropView(existing);
     } else {
       overrides.push({
@@ -368,6 +447,7 @@
         thumbs: thumbs,
         attachments: attachments,
         blobs: blobs || [],
+        gen: nextGen(),
         view: null
       });
     }
@@ -411,8 +491,33 @@
     });
   }
 
+  // Every record belongs to one conversation, and only the one on screen can be
+  // read, drawn or sent from. Keeping the rest costs a blob: URL per thumb that
+  // nothing revokes and every byte they hold, and it is read by pathHeldInMemory
+  // as "this conversation is open" - so the longer a session runs, the smaller
+  // the set §store is allowed to evict, and the budget stops being a budget.
+  //
+  // Dropping them loses nothing: every writer persists, so what is released here
+  // is already in the store and restoreOverrides reads it back on return. The
+  // in-flight dbWrite holds its own snapshot and is unaffected.
+  function releaseOffPath() {
+    var here = location.pathname;
+    for (var i = overrides.length - 1; i >= 0; i--) {
+      var o = overrides[i];
+      if (o.path === here) continue;
+      dropView(o);
+      releaseThumbs(o.thumbs, null);
+      overrides.splice(i, 1);
+    }
+  }
+
+  // Runs again on every route change, because the pathname it filters on is
+  // whatever is on screen at the moment it is called and the landing page is
+  // never the conversation. Idempotent per path: a record already in the array
+  // is left where it is.
   function restoreOverrides() {
-    dbReadAll(RECORDS).then(function (kept) {
+    releaseOffPath();
+    return dbReadAll(RECORDS).then(function (kept) {
       var mine = kept.filter(function (r) { return r && r.path === location.pathname; });
       if (!mine.length) return;
       mine.forEach(function (r) {
@@ -431,13 +536,29 @@
           }),
           attachments: r.attachments,
           blobs: blobs,
+          gen: nextGen(),
           view: null
         });
       });
       dbg('restoreOverrides:', mine.length, 'records read back for this conversation');
       schedule();
-    }).catch(function () {
-      // Nothing to restore.
+      // The read is asynchronous, so a plan built in the milliseconds before it
+      // landed found no record and took the request body as its base - the
+      // stale list §shape exists to avoid. A clean plan is thrown away and the
+      // next scan pass builds it again off the record; a dirty one is holding
+      // the user's edit, so it is kept and the cost is named instead.
+      if (plan && !plan.base && overrideAt(plan.index)) {
+        if (planIsDirty(plan)) {
+          reportDowngrade('edit built before its record loaded, its send may carry a stale list',
+            'message #' + plan.index);
+        } else {
+          discardPlan();
+        }
+      }
+    }).catch(function (err) {
+      // Resolving, not rethrowing: the prune chained onto this reads the store
+      // for itself and has no reason to be skipped because the restore failed.
+      say('warn', LOG_IMG, 'could not restore the attachment records:', err);
     });
   }
 
@@ -673,13 +794,29 @@
       && typeof n[5] === 'string' && n[5].indexOf('$') === 0;
   }
 
-  // The one request that asks the server what this conversation holds. Both
+  // The one request that asks the server what a conversation holds. Both
   // readers below parse the same payload; only how they find their message in
   // it differs.
-  function listConversation(label) {
-    var conv = conversationId();
-    if (!conv) return Promise.reject(new Error('no conversation on screen'));
-    return batchExecute(LIST_CONVERSATION_RPC, [conv, 10, null, 1, [1], [4], null, 1], label);
+  //
+  // Which conversation is the caller's to say when it has one pinned. Both
+  // readers are armed at one moment and resolve at another, and reading the
+  // location at request time answered whichever conversation the user had
+  // routed to in between - a name map from the wrong thread, or an upgrade
+  // aimed at a turn that is not there.
+  function listConversation(label, conv) {
+    // Falling back to the live read defeats the point of being handed a pinned
+    // id: both callers defer across an rpc, and the conversation on screen when
+    // the answer is wanted need not be the one the question was asked about.
+    var id = conv;
+    if (!id) {
+      id = conversationId();
+      if (id) {
+        reportDowngrade(label + ' reads whichever conversation is on screen',
+          'it was given no conversation id to pin to');
+      }
+    }
+    if (!id) return Promise.reject(new Error('no conversation on screen'));
+    return batchExecute(LIST_CONVERSATION_RPC, [id, 10, null, 1, [1], [4], null, 1], label);
   }
 
   // A thumbnail URL identifies one attachment, which a file name does not: the
@@ -697,8 +834,8 @@
   // message being edited for the first time has no record to read one from.
   // Without it every existing image is re-uploaded as image-<n>.jpg, and the
   // resend makes that the name the server keeps from then on.
-  function namesByThumb() {
-    return listConversation('namesByThumb').then(function (parsed) {
+  function namesByThumb(conv) {
+    return listConversation('namesByThumb', conv).then(function (parsed) {
       var names = {};
       (function walk(node) {
         if (!Array.isArray(node)) return;
@@ -719,17 +856,39 @@
   // array or the two describe different lists. Passing it in let an earlier
   // send's count meet a later send's record, which could only ever fail to
   // match.
-  function refreshOverride(index, attempt) {
+  //
+  // Everything below is aimed by an ordinal within a conversation, and none of
+  // it runs before 800ms after the send - seconds, once the retry below is
+  // counted. By then the user may be looking at another conversation, and the
+  // record at that ordinal may be a second send's, so both are pinned when the
+  // upgrade is armed and refused when they no longer hold. Object identity
+  // cannot stand in for the second check: installOverride rewrites a record in
+  // place, so the object is still the same object after another send has
+  // replaced everything in it.
+  function refreshOverride(index, attempt, conv, path, gen) {
+    // The ordinal counts messages in one conversation and means nothing in
+    // another. Re-reading it here wrote one turn's tokens into whichever
+    // record happened to sit at the same position in the thread the user had
+    // routed to, and then dropped that record's bytes.
+    if (location.pathname !== path) {
+      reportDowngrade('reference upgrade dropped, later resends of this message stay slow',
+        'the page moved from ' + path + ' to ' + location.pathname + ' before the upgrade ran');
+      return;
+    }
     var o = overrideAt(index);
     dbg('refreshOverride: fire, message #' + index + ', expect',
       o ? o.attachments.length : 0, 'attachments, attempt', attempt,
       '(record ' + (o ? 'found' : 'MISSING') + ')');
-    if (!o) return;
+    if (!o) {
+      reportDowngrade('reference upgrade dropped, later resends of this message stay slow',
+        'message #' + index + ' has no record left to upgrade');
+      return;
+    }
     // One separator for both sides of the comparison. It was a space on one
     // and a NUL on the other, which could only ever match a single-attachment
     // record and left every multi-image message stuck on its contrib paths.
     var SEP = '\u0000';
-    listConversation('refreshOverride').then(function (parsed) {
+    listConversation('refreshOverride', conv).then(function (parsed) {
       var wantNames = o.attachments.map(function (a) { return a[1]; }).sort().join(SEP);
       var expectedCount = o.attachments.length;
       var tuples = null;
@@ -747,13 +906,36 @@
       if (!tuples) {
         dbg('refreshOverride: no list matching the record\'s file names yet');
         if (attempt < 2) {
-          setTimeout(function () { refreshOverride(index, attempt + 1); }, 1500);
+          setTimeout(function () {
+            refreshOverride(index, attempt + 1, conv, path, gen);
+          }, 1500);
           return;
         }
         throw new Error('no attachment list matching the record');
       }
-      var current = overrideAt(index);
-      if (!current) return;
+      // By the pinned path, never the live one. overrideAt reads
+      // location.pathname, and the rpc above is long enough for the user to
+      // have routed elsewhere; the ordinal then resolves to whichever record
+      // sits at the same position in the conversation now on screen, and what
+      // follows would write this turn's tokens into it and destroy its bytes.
+      // The entry guard cannot cover this - it runs before the rpc, not after.
+      if (location.pathname !== path) {
+        reportDowngrade('reference upgrade dropped, later resends of this message stay slow',
+          'the page moved from ' + path + ' to ' + location.pathname
+          + ' while the upgrade was in flight');
+        return;
+      }
+      var current = overrideAtPath(index, path);
+      // The record this upgrade was armed for, or nothing. A second send to
+      // the same message rewrote it in place while the rpc was in flight, and
+      // what follows would replace that send's own list with the tokens of the
+      // turn the server has just been asked about and then destroy its bytes.
+      if (!current || current.gen !== gen) {
+        reportDowngrade('reference upgrade dropped, later resends of this message stay slow',
+          'message #' + index + ' was rewritten while the upgrade was in flight (generation '
+          + gen + ' -> ' + (current ? current.gen : 'gone') + ')');
+        return;
+      }
       current.attachments = tuples.map(function (t) {
         return [[null, 1, 1, t[11]], t[2], t[5]];
       });
@@ -769,6 +951,10 @@
       var freed = 0;
       (current.blobs || []).forEach(function (b) { if (b) freed += b.size || 0; });
       current.blobs = [];
+      // A writer like any other. The retry of a send that failed after this
+      // one landed is armed against the generation it reads then, not the one
+      // the upgrade started from.
+      current.gen = nextGen();
       dbg('refreshOverride: released', (freed / 1048576).toFixed(2) + 'MB of image bytes,',
         'the record now reads from the server references');
       persistOverrides();
