@@ -171,7 +171,7 @@
             + 're-uploading before the retry');
           freshenExisting(got.p);
           waitUntil(function () {
-            return freshReady(got.p) || null;
+            return planIsReady(got.p) || null;
           }, RETRY_UPLOAD_MS, function (ready) {
             if (!ready) {
               // The deadline expiring is not the whole story: the send goes out

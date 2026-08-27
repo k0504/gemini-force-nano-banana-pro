@@ -81,9 +81,18 @@
     return false;
   }
 
+  // Every entry, existing ones included. An existing entry reaches the server as
+  // an upload this document made or not at all: there is no second source to
+  // write it from, and the list the page built in its place carries the server's
+  // own references, which is the shape measured at 79.9s against 24.2s.
+  //
+  // This gates the Update button rather than the send, so the wait is spent
+  // before the press instead of inside the answer. The re-uploads start when
+  // edit mode opens, so by the time anything has been changed they are usually
+  // already done.
   function planIsReady(p) {
     return p.entries.every(function (entry) {
-      return entry.kind === 'existing' || entry.attachment;
+      return entry.kind === 'existing' ? entry.freshAttachment : entry.attachment;
     });
   }
 
@@ -126,7 +135,7 @@
   function syncSentinel(p) {
     var textarea = textareaOf(p);
     if (!textarea) return;
-    var wanted = planIsDirty(p);
+    var wanted = planIsDirty(p) && planIsReady(p);
     if (wanted === p.sentinelApplied) return;
     dbg('syncSentinel:', wanted ? 'appending zero-width space to textarea' : 'removing zero-width space from textarea');
     writeTextarea(textarea, wanted
@@ -298,12 +307,6 @@
     });
   }
 
-  function freshReady(p) {
-    return p.entries.every(function (entry) {
-      return entry.kind === 'new' ? entry.attachment : entry.freshAttachment;
-    });
-  }
-
   // §apply ===================================================================
   // Whether the send being built is the resend of an edited message. Asked in
   // two places - before the list is written, and by the §resend route that owes
@@ -323,7 +326,7 @@
   // send that carries it, plan or no plan, which is the only rule that also
   // covers the retry of a message with no attachments; a second strip here
   // could only ever find nothing and read as though it were doing the work.
-  function applyPlanTo(inner, p, fresh) {
+  function applyPlanTo(inner, p) {
     if (!isEditResend(inner)) {
       dbg('applyPlanTo: action is', JSON.stringify(inner[ACTION_INDEX]), '(not edit resend 2), skip');
       return null;
@@ -346,7 +349,7 @@
     // about an entry added since, and a new entry whose upload failed carries
     // no attachment at all.
     var missing = p.entries.filter(function (entry) {
-      return entry.kind === 'existing' ? (fresh && !entry.freshAttachment) : !entry.attachment;
+      return entry.kind === 'existing' ? !entry.freshAttachment : !entry.attachment;
     }).length;
     var count = Array.isArray(base) ? base.length : 0;
     if (missing) {
@@ -362,8 +365,7 @@
         // script uploads goes out with the action cleared, so the trailing edit
         // marker must never ride along; a captured send once showed it doing so.
         if (entry.kind !== 'existing') return [entry.attachment[0], entry.attachment[1]];
-        if (fresh) return [entry.freshAttachment[0], entry.freshAttachment[1]];
-        return base[entry.index];
+        return [entry.freshAttachment[0], entry.freshAttachment[1]];
       });
       listWritten = true;
       dbg('applyPlanTo: wrote', attShape(tuple[ATTACHMENTS]));

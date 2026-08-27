@@ -49,7 +49,7 @@
       if (!planIsReady(p)) {
         return backOut(inner, p, 'an upload on the plan for this message never finished');
       }
-      var kept = applyPlanTo(inner, p, false);
+      var kept = applyPlanTo(inner, p);
       // The same reading of that return as the route below: null means this
       // send is not the one the plan was made for, so it is left alone.
       if (kept === null) return null;
@@ -82,29 +82,28 @@
       teardownEditorUi();
       return null;
     }
-    if (dirty && !planIsReady(p)) {
-      return backOut(inner, p, 'an upload staged in this edit has not finished');
-    }
-
-    var hasNew = p.entries.some(function (entry) { return entry.kind === 'new'; });
-    var fresh = freshReady(p);
-    if (!fresh) {
-      dbg('editorContribution: re-uploads not finished, the record\'s own references are sent');
-      // Naming the entries, because the two ways to arrive here want opposite
-      // things from the user: an upload still running means the next send of
-      // the same message is fast, one that failed means this plan never will
-      // be and the image wants replacing by hand.
-      reportDowngrade('re-uploads unfinished, the record\'s own references are sent '
-        + 'instead (measured 79.9s vs 24.2s)',
-        p.entries.filter(function (entry) {
-          return entry.kind === 'existing' && !entry.freshAttachment;
+    // One gate, dirty or not. An existing entry reaches the server as an upload
+    // this document made or not at all, so a plan that is not ready has nothing
+    // to write the list from - and the list the page built in its place carries
+    // the server's own references, the shape measured at 79.9s against 24.2s.
+    // Update stays locked until this holds, so arriving here means the press beat
+    // the lock; the entries are named because the two ways to get here want
+    // opposite things from the user - an upload still running means the next
+    // press is fast, one that failed means this plan never will be and the image
+    // wants replacing by hand.
+    if (!planIsReady(p)) {
+      return backOut(inner, p, 'the uploads for this edit have not finished: '
+        + p.entries.filter(function (entry) {
+          return entry.kind === 'existing' ? !entry.freshAttachment : !entry.attachment;
         }).map(function (entry) {
-          return 'existing#' + entry.index + ' '
-            + (entry.freshError ? 'failed: ' + entry.freshError : 'still uploading');
+          return (entry.kind === 'existing' ? 'existing#' + entry.index : 'new:' + entry.name)
+            + ' ' + (entry.freshError ? 'failed: ' + entry.freshError : 'still uploading');
         }).join(', '));
     }
 
-    var listWritten = applyPlanTo(inner, p, fresh);
+    var hasNew = p.entries.some(function (entry) { return entry.kind === 'new'; });
+
+    var listWritten = applyPlanTo(inner, p);
     if (listWritten === null) return null;
 
     if (listWritten) {
