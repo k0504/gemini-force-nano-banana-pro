@@ -6,7 +6,7 @@
 // @license      MIT
 // @homepageURL  https://github.com/k0504/gemini-imgen-enhancer
 // @supportURL   https://github.com/k0504/gemini-imgen-enhancer/issues
-// @version      3.41.0
+// @version      3.42.0
 // @description  Force Gemini image generation onto Nano Banana Pro from the first request, and edit the images attached to an existing prompt.
 // @description:zh-TW  自首次請求即強制以 Nano Banana Pro 生成圖片，並可編輯既有 prompt 附加的圖片。
 // @match        https://gemini.google.com/*
@@ -136,7 +136,7 @@
   var WIZ_KEYS = { pctx: 'Ylro7b', pushId: 'qKIAYe', at: 'SNlM0e', bl: 'cfb2h', sid: 'FdrFJe' };
 
   // §config ==================================================================
-  var VERSION = '3.41.0';
+  var VERSION = '3.42.0';
 
   // Gemini keeps its own Update button disabled until the prompt text differs
   // from what the message already holds, so an image-only change cannot be
@@ -3450,7 +3450,24 @@
   }
 
   // §lifecycle ===============================================================
+  // The application routes without reloading, so the pathname changing is the
+  // only sign a different page is on screen. Read from the scan pass rather
+  // than from history: a route change rebuilds the view, so a pass is already
+  // on its way, and nothing of the page's own has to be wrapped.
+  var lastPath = location.pathname;
+  function watchRoute() {
+    if (location.pathname === lastPath) return;
+    lastPath = location.pathname;
+    if (lastPath.indexOf('/library') !== 0) return;
+    // Behind the page's own listing, which is what keeps the replayed template
+    // current. Shorter than the wait at boot: by now a template is held - the
+    // library page issues a listing whenever it opens, and it is persisted -
+    // so this waits on the request being current, not on there being one.
+    setTimeout(indexLibrary, 1500);
+  }
+
   function scan() {
+    watchRoute();
     // Ahead of the editor's own gate: the usage line is not part of that
     // feature and is drawn whether or not it is switched on.
     ensureUsageLine();
@@ -5155,10 +5172,28 @@
   // Only the index is built here. Nothing is fetched per conversation, which is
   // what makes this cheap enough to run unasked; filling the ledger itself is
   // still the sweep's job and still asked for from the menu.
+  //
+  // Once per visit, not once per page load. Every mark is drawn from this
+  // index, and an image made after it was built is absent from it, so a load
+  // that read the listing before that image existed marks nothing for it. The
+  // application never reloads on its own, so nothing rebuilt the index either,
+  // and the mark stayed missing until the page was reloaded by hand - which is
+  // indistinguishable from the mark being broken.
+  //
+  // The interval is against a library entered and left repeatedly: thirteen
+  // requests and a progress panel per visit, for an index that cannot have
+  // moved in between. Making an image and coming back takes longer than this.
+  var INDEX_MIN_GAP = 60000;
+  var indexedAt = 0;
+
   function indexLibrary() {
     if (location.pathname.indexOf('/library') !== 0) return;
-    if (harvested) return;
+    // `harvested` no longer serves as this guard, since it now says a harvest
+    // has happened at some point rather than that one is under way.
+    if (harvesting) return;
+    if (harvested && Date.now() - indexedAt < INDEX_MIN_GAP) return;
     harvested = true;
+    indexedAt = Date.now();
     // The index alone, which is thirteen requests. The sweep that follows it is
     // one request per conversation and stays on the menu: running 189 of them
     // unasked, twelve abreast, on top of the replay is what put this browser in
@@ -5185,6 +5220,7 @@
     // it is read first and the sweep follows on what it found.
     if (location.pathname.indexOf('/library') === 0 && !harvested) {
       harvested = true;
+      indexedAt = Date.now();
       // The harvest is an optimisation, not a precondition: the ids it looks
       // for also arrive on their own, from every listing answer the page makes.
       // So it is given a deadline and the sweep runs either way, rather than a

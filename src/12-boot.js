@@ -1,5 +1,22 @@
   // §lifecycle ===============================================================
+  // The application routes without reloading, so the pathname changing is the
+  // only sign a different page is on screen. Read from the scan pass rather
+  // than from history: a route change rebuilds the view, so a pass is already
+  // on its way, and nothing of the page's own has to be wrapped.
+  var lastPath = location.pathname;
+  function watchRoute() {
+    if (location.pathname === lastPath) return;
+    lastPath = location.pathname;
+    if (lastPath.indexOf('/library') !== 0) return;
+    // Behind the page's own listing, which is what keeps the replayed template
+    // current. Shorter than the wait at boot: by now a template is held - the
+    // library page issues a listing whenever it opens, and it is persisted -
+    // so this waits on the request being current, not on there being one.
+    setTimeout(indexLibrary, 1500);
+  }
+
   function scan() {
+    watchRoute();
     // Ahead of the editor's own gate: the usage line is not part of that
     // feature and is drawn whether or not it is switched on.
     ensureUsageLine();

@@ -703,10 +703,28 @@
   // Only the index is built here. Nothing is fetched per conversation, which is
   // what makes this cheap enough to run unasked; filling the ledger itself is
   // still the sweep's job and still asked for from the menu.
+  //
+  // Once per visit, not once per page load. Every mark is drawn from this
+  // index, and an image made after it was built is absent from it, so a load
+  // that read the listing before that image existed marks nothing for it. The
+  // application never reloads on its own, so nothing rebuilt the index either,
+  // and the mark stayed missing until the page was reloaded by hand - which is
+  // indistinguishable from the mark being broken.
+  //
+  // The interval is against a library entered and left repeatedly: thirteen
+  // requests and a progress panel per visit, for an index that cannot have
+  // moved in between. Making an image and coming back takes longer than this.
+  var INDEX_MIN_GAP = 60000;
+  var indexedAt = 0;
+
   function indexLibrary() {
     if (location.pathname.indexOf('/library') !== 0) return;
-    if (harvested) return;
+    // `harvested` no longer serves as this guard, since it now says a harvest
+    // has happened at some point rather than that one is under way.
+    if (harvesting) return;
+    if (harvested && Date.now() - indexedAt < INDEX_MIN_GAP) return;
     harvested = true;
+    indexedAt = Date.now();
     // The index alone, which is thirteen requests. The sweep that follows it is
     // one request per conversation and stays on the menu: running 189 of them
     // unasked, twelve abreast, on top of the replay is what put this browser in
@@ -733,6 +751,7 @@
     // it is read first and the sweep follows on what it found.
     if (location.pathname.indexOf('/library') === 0 && !harvested) {
       harvested = true;
+      indexedAt = Date.now();
       // The harvest is an optimisation, not a precondition: the ids it looks
       // for also arrive on their own, from every listing answer the page makes.
       // So it is given a deadline and the sweep runs either way, rather than a
