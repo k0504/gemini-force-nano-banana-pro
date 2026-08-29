@@ -497,6 +497,33 @@
   var xhrOpen = XMLHttpRequest.prototype.open;
   var xhrSend = XMLHttpRequest.prototype.send;
   var xhrSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+  var xhrAbort = XMLHttpRequest.prototype.abort;
+
+  // Routing to another conversation makes the application abort the generation
+  // it left behind, and the server then has no one listening for the rest of a
+  // turn it is already billing for. The request is left running instead: the
+  // application has stopped reading it either way, and what running on buys is
+  // the server finishing the turn and filing it, so returning to the
+  // conversation shows the images rather than a turn that stopped halfway.
+  //
+  // Only the abort that follows a route change is ignored. Stopping a
+  // generation from the page's own control happens in the conversation that
+  // owns it, so an abort raised while the pathname is still the one the send
+  // went out on is passed through untouched - the user asked for that one.
+  //
+  // Compared against the pathname the request itself went out on rather than a
+  // remembered "previous" one: a second route change while the first request is
+  // still running would make any single remembered value name the wrong page.
+  XMLHttpRequest.prototype.abort = function () {
+    if (this.__gpieStreamPath && this.readyState !== 4
+      && location.pathname !== this.__gpieStreamPath) {
+      dbg('xhr: abort of a StreamGenerate ignored, the page routed from',
+        this.__gpieStreamPath, 'to', location.pathname,
+        '- the turn is left to finish on the server');
+      return;
+    }
+    return xhrAbort.apply(this, arguments);
+  };
 
   XMLHttpRequest.prototype.open = function (method, url) {
     this.__gemUrl = url;
@@ -525,6 +552,10 @@
     if (typeof this.__gemUrl === 'string' && this.__gemUrl.indexOf('StreamGenerate') !== -1) {
       dbg('xhr: sending StreamGenerate, body', result.body === body ? 'untouched' : 'rewritten');
       keepBody(this.__gemUrl, result.body, result.body !== body);
+      // Read here, at the send, so the abort hook above compares against the
+      // conversation this request was made in and not against wherever the
+      // page has got to by the time the abort arrives.
+      this.__gpieStreamPath = location.pathname;
       // This runs after rewrite() above, so a hold armed by commitSend inside it
       // is claimed by the very request that carries the send.
       traceStream(this, takeWork(), claimInflightSend());
