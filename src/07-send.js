@@ -436,10 +436,22 @@
       report(w, 'failed after ' + secs(Date.now() - t0));
       sendFailed(sent, 'the request errored');
     });
+    // An abort is the local end hanging up, not the send failing. The request
+    // left this document long before - the body carries references, not bytes -
+    // so the server has it, is generating against it, and bills for it whether
+    // or not anything here is still listening. What the record describes is
+    // what this message was sent with, so the turn is settled as made: the list
+    // stands and the records after it go, exactly as on a response received.
+    // Routing away mid-generation is what raises this, and rolling the record
+    // back there left the message on screen holding images no record explained.
     xhr.addEventListener('abort', function () {
-      dbg('xhr: StreamGenerate aborted after', ((Date.now() - t0) / 1000).toFixed(1) + 's');
-      report(w, 'aborted after ' + secs(Date.now() - t0));
-      sendFailed(sent, 'the request was aborted');
+      dbg('xhr: StreamGenerate aborted after', ((Date.now() - t0) / 1000).toFixed(1) + 's,',
+        'settled as made - the server has the request either way');
+      report(w, 'aborted after ' + secs(Date.now() - t0) + ' (the turn was still made)');
+      sendLanded(sent);
+      // The generation runs on regardless, so the allowance it spends is read
+      // back on this path too.
+      noteGenerationFinished();
     });
   }
 
@@ -616,7 +628,17 @@
           else sendLanded(hold);
           return res;
         }, function (err) {
-          sendFailed(hold, 'the fetch failed');
+          // An abort is the local end hanging up on a request the server
+          // already has, so the turn was made and is settled as made; anything
+          // else is the request not having gone out at all.
+          if (err && err.name === 'AbortError') {
+            dbg('fetch: StreamGenerate aborted after', ((Date.now() - t0) / 1000).toFixed(1)
+              + 's, settled as made - the server has the request either way');
+            sendLanded(hold);
+            noteGenerationFinished();
+          } else {
+            sendFailed(hold, 'the fetch failed');
+          }
           throw err;
         });
       }
