@@ -21,8 +21,82 @@
     return null;
   }
 
+  // §native-retry ============================================================
+  // Gemini's own regenerate button. It is the one send that carries an
+  // attachment list this script holds a record for and has no plan to write it
+  // from, and it was reaching the server untouched.
+  //
+  // §retry clones itself only onto turns whose action row has no native button,
+  // so the latest turn - the only turn that button is rendered on - is served by
+  // the page's own control. The list that control builds is the one the message
+  // held before the resend that produced it, which is the rule §record exists to
+  // state: from the first resend onwards the record, not the request body, is
+  // what a message's attachment list means. A regenerate pressed after an edit
+  // therefore generated against the images the edit had just replaced, and
+  // filed that list back onto the turn, so the next edit read it back as the
+  // message's own and the divergence outlived the press.
+  //
+  // The record's tuples go out as they stand: no freshen, no reshape. The
+  // server already holds these references, and §retry measured the converted
+  // shape at 78.2s against 6.3s for leaving them alone.
+  //
+  // Nothing is committed. A regenerate replaces the answer to the last turn, so
+  // there are no later turns to discard, and the list written here is the
+  // record's own - there is nothing new to record and nothing to roll back.
+  function nativeRetryContribution(inner) {
+    if (!isNativeRetry(inner)) return null;
+
+    var tuple = inner[PROMPT_TUPLE];
+    var body = tuple[ATTACHMENTS];
+    if (!Array.isArray(body) || !body.length) {
+      dbg('nativeRetry: the regenerate carries no attachments, nothing to correct');
+      return null;
+    }
+
+    var index = lastMessageIndex();
+    var base = index < 0 ? null : recordAttachments(index);
+    // Not a downgrade. A message this script has never resent is described by
+    // the page correctly, and that is most of them.
+    if (!base) {
+      dbg('nativeRetry: message #' + index + ' has no record, the page\'s own list stands');
+      return null;
+    }
+    if (base.length !== body.length) {
+      reportDowngrade('regenerate sent with the list the page built, which is the one from '
+        + 'before this message was last resent',
+        'the record for message #' + index + ' holds ' + base.length
+        + ' attachments against the ' + body.length + ' the send carries');
+      return null;
+    }
+    // An upload the server has already collected fails the send outright, and
+    // there is no plan here to re-upload it from: this runs inside
+    // XMLHttpRequest.send and an upload is three round trips. The page's list is
+    // stale but it resolves, so it is left to stand and what that costs is
+    // named rather than traded for a send that cannot go out at all.
+    var stale = base.filter(function (att) {
+      return attClass(att) === 'contrib-stale';
+    }).length;
+    if (stale) {
+      reportDowngrade('regenerate sent with the list the page built, which is the one from '
+        + 'before this message was last resent',
+        stale + ' of the record\'s attachments are uploads this document cannot vouch for');
+      return null;
+    }
+
+    tuple[ATTACHMENTS] = base;
+    dbg('nativeRetry: message #' + index + ', attachments written from the record |',
+      attShape(base));
+    // False rather than true: a list was written, and no reload is owed for it.
+    return false;
+  }
+
   function editorContribution(inner) {
     if (!imageEditor) return null;
+    // Ahead of the plan, and never through it. A regenerate is the page's own
+    // control, so an editor left open on some other message must neither decide
+    // what it sends nor be spent by it - activePlan is a getter that expires
+    // what it reads.
+    if (isNativeRetry(inner)) return nativeRetryContribution(inner);
     var p = activePlan();
     if (!p) { dbg('editorContribution: no active plan, leaving attachments alone'); return null; }
 

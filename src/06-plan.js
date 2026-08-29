@@ -317,6 +317,14 @@
     return inner[ACTION_INDEX] === ACTION_EDIT_RESEND;
   }
 
+  // Gemini's own regenerate, plain or Pro. Both are answered the same way and
+  // by the same reader, so the two values are compared in one place: see
+  // §native-retry.
+  function isNativeRetry(inner) {
+    var action = inner[ACTION_INDEX];
+    return action === ACTION_RETRY || action === ACTION_RETRY_PRO;
+  }
+
   // Writes the plan into the outgoing prompt tuple. null means only that this
   // send is not the one the plan was made for; true that the attachment list
   // was written, false that it was backed out of - a send that is still an edit

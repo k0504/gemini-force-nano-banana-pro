@@ -6,7 +6,7 @@
 // @license      MIT
 // @homepageURL  https://github.com/k0504/gemini-imgen-enhancer
 // @supportURL   https://github.com/k0504/gemini-imgen-enhancer/issues
-// @version      3.53.0
+// @version      3.54.0
 // @description  Force Gemini image generation onto Nano Banana Pro from the first request, and edit the images attached to an existing prompt.
 // @description:zh-TW  自首次請求即強制以 Nano Banana Pro 生成圖片，並可編輯既有 prompt 附加的圖片。
 // @match        https://gemini.google.com/*
@@ -103,6 +103,11 @@
   var RESUME_INDEX = 9;
   var ACTION_INDEX = 72;
   var ACTION_EDIT_RESEND = 2;
+  // Gemini's own regenerate button, plain and Pro. Neither carries a turn
+  // identifier, so the server regenerates the conversation's last turn - see
+  // §native-retry, which is the only reader of these.
+  var ACTION_RETRY = 5;
+  var ACTION_RETRY_PRO = 7;
 
   // Verified against a three-way diff of first pass / plain retry / Pro retry.
   // The trailing 1 is the switch: 0 selects Nano Banana 2, 1 selects Pro.
@@ -136,7 +141,7 @@
   var WIZ_KEYS = { pctx: 'Ylro7b', pushId: 'qKIAYe', at: 'SNlM0e', bl: 'cfb2h', sid: 'FdrFJe' };
 
   // §config ==================================================================
-  var VERSION = '3.53.0';
+  var VERSION = '3.54.0';
 
   // Gemini keeps its own Update button disabled until the prompt text differs
   // from what the message already holds, so an image-only change cannot be
@@ -1154,6 +1159,15 @@
 
   function indexOfHost(host) {
     return Array.prototype.indexOf.call(hostsNow(), host);
+  }
+
+  // Which message a native regenerate speaks for. That request carries no turn
+  // identifier at all - see §native-retry - so the server takes the
+  // conversation's last turn, and the record at this ordinal is the only one
+  // such a send can be written from. -1 when the conversation is not on screen,
+  // which its caller reads as "no record".
+  function lastMessageIndex() {
+    return hostsNow().length - 1;
   }
 
   // The rule the record exists for, stated once: from the moment this script
@@ -2252,6 +2266,14 @@
     return inner[ACTION_INDEX] === ACTION_EDIT_RESEND;
   }
 
+  // Gemini's own regenerate, plain or Pro. Both are answered the same way and
+  // by the same reader, so the two values are compared in one place: see
+  // §native-retry.
+  function isNativeRetry(inner) {
+    var action = inner[ACTION_INDEX];
+    return action === ACTION_RETRY || action === ACTION_RETRY_PRO;
+  }
+
   // Writes the plan into the outgoing prompt tuple. null means only that this
   // send is not the one the plan was made for; true that the attachment list
   // was written, false that it was backed out of - a send that is still an edit
@@ -2402,8 +2424,82 @@
     return null;
   }
 
+  // §native-retry ============================================================
+  // Gemini's own regenerate button. It is the one send that carries an
+  // attachment list this script holds a record for and has no plan to write it
+  // from, and it was reaching the server untouched.
+  //
+  // §retry clones itself only onto turns whose action row has no native button,
+  // so the latest turn - the only turn that button is rendered on - is served by
+  // the page's own control. The list that control builds is the one the message
+  // held before the resend that produced it, which is the rule §record exists to
+  // state: from the first resend onwards the record, not the request body, is
+  // what a message's attachment list means. A regenerate pressed after an edit
+  // therefore generated against the images the edit had just replaced, and
+  // filed that list back onto the turn, so the next edit read it back as the
+  // message's own and the divergence outlived the press.
+  //
+  // The record's tuples go out as they stand: no freshen, no reshape. The
+  // server already holds these references, and §retry measured the converted
+  // shape at 78.2s against 6.3s for leaving them alone.
+  //
+  // Nothing is committed. A regenerate replaces the answer to the last turn, so
+  // there are no later turns to discard, and the list written here is the
+  // record's own - there is nothing new to record and nothing to roll back.
+  function nativeRetryContribution(inner) {
+    if (!isNativeRetry(inner)) return null;
+
+    var tuple = inner[PROMPT_TUPLE];
+    var body = tuple[ATTACHMENTS];
+    if (!Array.isArray(body) || !body.length) {
+      dbg('nativeRetry: the regenerate carries no attachments, nothing to correct');
+      return null;
+    }
+
+    var index = lastMessageIndex();
+    var base = index < 0 ? null : recordAttachments(index);
+    // Not a downgrade. A message this script has never resent is described by
+    // the page correctly, and that is most of them.
+    if (!base) {
+      dbg('nativeRetry: message #' + index + ' has no record, the page\'s own list stands');
+      return null;
+    }
+    if (base.length !== body.length) {
+      reportDowngrade('regenerate sent with the list the page built, which is the one from '
+        + 'before this message was last resent',
+        'the record for message #' + index + ' holds ' + base.length
+        + ' attachments against the ' + body.length + ' the send carries');
+      return null;
+    }
+    // An upload the server has already collected fails the send outright, and
+    // there is no plan here to re-upload it from: this runs inside
+    // XMLHttpRequest.send and an upload is three round trips. The page's list is
+    // stale but it resolves, so it is left to stand and what that costs is
+    // named rather than traded for a send that cannot go out at all.
+    var stale = base.filter(function (att) {
+      return attClass(att) === 'contrib-stale';
+    }).length;
+    if (stale) {
+      reportDowngrade('regenerate sent with the list the page built, which is the one from '
+        + 'before this message was last resent',
+        stale + ' of the record\'s attachments are uploads this document cannot vouch for');
+      return null;
+    }
+
+    tuple[ATTACHMENTS] = base;
+    dbg('nativeRetry: message #' + index + ', attachments written from the record |',
+      attShape(base));
+    // False rather than true: a list was written, and no reload is owed for it.
+    return false;
+  }
+
   function editorContribution(inner) {
     if (!imageEditor) return null;
+    // Ahead of the plan, and never through it. A regenerate is the page's own
+    // control, so an editor left open on some other message must neither decide
+    // what it sends nor be spent by it - activePlan is a getter that expires
+    // what it reads.
+    if (isNativeRetry(inner)) return nativeRetryContribution(inner);
     var p = activePlan();
     if (!p) { dbg('editorContribution: no active plan, leaving attachments alone'); return null; }
 

@@ -34,6 +34,11 @@
   var RESUME_INDEX = 9;
   var ACTION_INDEX = 72;
   var ACTION_EDIT_RESEND = 2;
+  // Gemini's own regenerate button, plain and Pro. Neither carries a turn
+  // identifier, so the server regenerates the conversation's last turn - see
+  // §native-retry, which is the only reader of these.
+  var ACTION_RETRY = 5;
+  var ACTION_RETRY_PRO = 7;
 
   // Verified against a three-way diff of first pass / plain retry / Pro retry.
   // The trailing 1 is the switch: 0 selects Nano Banana 2, 1 selects Pro.
@@ -67,7 +72,7 @@
   var WIZ_KEYS = { pctx: 'Ylro7b', pushId: 'qKIAYe', at: 'SNlM0e', bl: 'cfb2h', sid: 'FdrFJe' };
 
   // §config ==================================================================
-  var VERSION = '3.53.0';
+  var VERSION = '3.54.0';
 
   // Gemini keeps its own Update button disabled until the prompt text differs
   // from what the message already holds, so an image-only change cannot be

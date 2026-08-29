@@ -433,6 +433,15 @@
     return Array.prototype.indexOf.call(hostsNow(), host);
   }
 
+  // Which message a native regenerate speaks for. That request carries no turn
+  // identifier at all - see §native-retry - so the server takes the
+  // conversation's last turn, and the record at this ordinal is the only one
+  // such a send can be written from. -1 when the conversation is not on screen,
+  // which its caller reads as "no record".
+  function lastMessageIndex() {
+    return hostsNow().length - 1;
+  }
+
   // The rule the record exists for, stated once: from the moment this script
   // resends a message, what the record holds outranks anything the page still
   // shows for it or still builds for it. Gemini's carousel keeps drawing the
