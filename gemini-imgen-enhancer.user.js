@@ -6,7 +6,7 @@
 // @license      MIT
 // @homepageURL  https://github.com/k0504/gemini-imgen-enhancer
 // @supportURL   https://github.com/k0504/gemini-imgen-enhancer/issues
-// @version      3.52.0
+// @version      3.53.0
 // @description  Force Gemini image generation onto Nano Banana Pro from the first request, and edit the images attached to an existing prompt.
 // @description:zh-TW  自首次請求即強制以 Nano Banana Pro 生成圖片，並可編輯既有 prompt 附加的圖片。
 // @match        https://gemini.google.com/*
@@ -136,7 +136,7 @@
   var WIZ_KEYS = { pctx: 'Ylro7b', pushId: 'qKIAYe', at: 'SNlM0e', bl: 'cfb2h', sid: 'FdrFJe' };
 
   // §config ==================================================================
-  var VERSION = '3.52.0';
+  var VERSION = '3.53.0';
 
   // Gemini keeps its own Update button disabled until the prompt text differs
   // from what the message already holds, so an image-only change cannot be
@@ -4373,14 +4373,6 @@
   var LIBRARY_LIST_RPC = 'jGArJ';
   var STORE_CONV_FREQ = 'gpie_conv_freq';
   var STORE_LIST_FREQ = 'gpie_list_freq';
-  // The lightbox's own download request, kept whole: the envelope it sends and
-  // the address it sends it to. What goes out is that request with the values
-  // that name the image swapped and nothing else touched.
-  var STORE_DL_FREQ = 'gpie_dl_freq';
-  var STORE_DL_URL = 'gpie_dl_url';
-  // The lightbox's own download request, kept verbatim. Nothing here is
-  // composed: what goes out is that request with its token and its three ids
-  // swapped and not one other character touched.
 
   // Ids are sixteen hex digits behind a prefix that says what they name: a
   // conversation, a response, a candidate. Only a conversation id is a
@@ -4394,11 +4386,6 @@
   // because the library page sends neither of its own: the templates have to
   // survive the visit to the conversation that produced them.
   var freqCache = Object.create(null);
-
-  // The download envelope this script put on the wire last. The capture hook
-  // sees it come by like any other and would file it as the page's own; the
-  // exact body is what tells the two apart.
-  var sentByUs = null;
 
   function storedFreq(store) {
     if (freqCache[store] !== undefined) return freqCache[store];
@@ -4418,9 +4405,7 @@
     if (!node) return;
     node.setAttribute('data-templates',
       'conversation=' + (storedFreq(STORE_CONV_FREQ) ? 'held' : 'none')
-      + ' listing=' + (storedFreq(STORE_LIST_FREQ) ? 'held' : 'none')
-      + ' download=' + (storedFreq(STORE_DL_FREQ) ? storedFreq(STORE_DL_FREQ).length + ' chars' : 'none')
-      + ' address=' + (storedFreq(STORE_DL_URL) ? 'held' : 'none'));
+      + ' listing=' + (storedFreq(STORE_LIST_FREQ) ? 'held' : 'none'));
   }
 
   function keepFreq(store, freq) {
@@ -4457,27 +4442,10 @@
       return;
     }
 
-    // The lightbox's download, captured wherever it is pressed and persisted:
-    // the library page never sends one of its own.
-    //
-    // This script's own replay goes out over the same transport and reaches
-    // this hook exactly as the page's does, so what it sent last is held and
-    // refused here. Without that the store learns from itself: a body this
-    // script composed was recorded as the page's, replayed on every later
-    // download, and kept being refused long after a press of the real button
-    // would have taught the shape that works.
-    if (url.indexOf('rpcids=' + DOWNLOAD_RPC) !== -1) {
-      if (freq === sentByUs) {
-        dbg('library: this script\'s own download request, not recorded as a template');
-        return;
-      }
-      keepFreq(STORE_DL_URL, url);
-      if (keepFreq(STORE_DL_FREQ, freq)) {
-        info('library: the lightbox download request was recorded, ' + freq.length + ' chars');
-      }
-      noteTemplates();
-      return;
-    }
+    // The download request is not kept. It is composed from the ledger for the
+    // image being asked for - see §library:token - and a body kept from one
+    // image names that image's address, which is the one field the server reads
+    // and refuses when it disagrees with the token beside it.
 
     if (url.indexOf('rpcids=' + CONV_LOAD_RPC) === -1) return;
     // A conversation id is what gets swapped in, so a request that does not
@@ -4668,62 +4636,33 @@
     return rows;
   }
 
-  // The lightbox's own envelope, replayed. Its shape is Gemini's and
-  // undocumented, so nothing in it is composed here: what changes is the media
-  // token and the three ids that name the image, by shape rather than by
-  // position, and every other byte is the one the lightbox sent.
-  function swapDownloadFreq(freq, row, conv) {
-    var parsed = innerOf(freq);
-    var seen = { token: 0, resp: 0, rc: 0, conv: 0 };
-    (function walk(node) {
-      if (!Array.isArray(node)) return;
-      for (var i = 0; i < node.length; i++) {
-        var v = node[i];
-        if (typeof v === 'string') {
-          if (v.charAt(0) === '$') { node[i] = row.token; seen.token++; }
-          else if (/^r_[0-9a-f]{16}$/.test(v)) { node[i] = row.resp; seen.resp++; }
-          else if (/^rc_[0-9a-f]{16}$/.test(v)) { node[i] = row.rc; seen.rc++; }
-          else if (/^c_[0-9a-f]{16}$/.test(v)) { node[i] = 'c_' + conv; seen.conv++; }
-        } else {
-          walk(v);
-        }
-      }
-    })(parsed.inner);
-    if (!seen.token) throw new Error('the recorded download names no token to swap');
-    if (!seen.resp || !seen.conv) throw new Error('the recorded download names no turn to swap');
-    dbg('download: recorded envelope swapped -', JSON.stringify(seen));
-    parsed.outer[0][0][1] = JSON.stringify(parsed.inner);
-    return JSON.stringify(parsed.outer);
-  }
-
-  // The request the lightbox sends, in the form it sends it.
+  // The request the lightbox sends, reduced to the part of it that names the
+  // image.
   //
   //   POST /_/BardChatUi/data/batchexecute
   //        ?rpcids=c8o8Fe&source-path=/app/<conv>&bl=..&f.sid=..&hl=..&_reqid=..&rt=c
   //   f.req=<urlencoded [[["c8o8Fe","<inner>",null,"generic"]]]>&at=<csrf>&
   //
-  // The inner array names the image: its media token, and the three ids of the
-  // turn it belongs to. Nothing of that shape is composed here. A body written
-  // from this description - the token and the three ids in an envelope of five
-  // positions - is refused by the server with `BardErrorInfo [1003]`, measured
-  // against the page's own body for the same image, which is answered. The
-  // envelope carries more than the values that name the image, so the page's
-  // own is replayed or nothing is sent at all.
+  // The page sends more than this: beside the token it carries the image's
+  // googleusercontent address, the prompt that made it and the model that ran,
+  // which is why its body runs past a thousand characters where this one is
+  // under five hundred. Measured field by field against the page's own body
+  // (2026-08-29), the server reads exactly one of the extra fields and only
+  // when it is there: the address. Left out, the call is answered; carrying an
+  // address that belongs to another image, it is refused with
+  // `BardErrorInfo [1003]`.
+  //
+  // That is what makes this composed rather than replayed. A body kept from one
+  // image cannot serve another - its address would have to be swapped along
+  // with the token, and the address is the one value the ledger has no copy of.
   function originalByToken(row, conv) {
-    var recorded = storedFreq(STORE_DL_FREQ);
-    if (!recorded) {
-      return Promise.reject(new Error('no download template yet; press a download'
-        + ' button once and the page teaches the shape'));
-    }
-    var freq;
-    try {
-      freq = swapDownloadFreq(recorded, row, conv);
-    } catch (err) {
-      return Promise.reject(err);
-    }
-    // Held before the request goes out: the capture hook reads it on the way
-    // past, inside this same call.
-    sentByUs = freq;
+    var inner = [
+      [[null, null, null, [null, null, null, null, null, row.token]],
+        null, null, null, null, null, null, null, null, null],
+      [row.resp, row.rc, 'c_' + conv, null, null],
+      1, 0, 1
+    ];
+    var freq = JSON.stringify([[[DOWNLOAD_RPC, JSON.stringify(inner), null, 'generic']]]);
     return rpcPost(rpcUrl(DOWNLOAD_RPC, conv), freq, DOWNLOAD_RPC, 'original by token')
       .then(function (payload) {
         var url = payload && payload[0];
@@ -5052,19 +4991,9 @@
   }
 
 
-  // Whether the page has taught the shape of a download request yet. Until it
-  // has there is no request to send, so a button taken here would answer
-  // nothing at all - and the press that teaches it is a press of the very
-  // button this would take. The first press on a fresh profile therefore goes
-  // to Gemini and costs the preview; every press after it answers the original.
-  function taught() {
-    return !!storedFreq(STORE_DL_FREQ);
-  }
-
   // The same question the mark answers: is there a media token for this image.
   // Nothing else is a reason to take a button.
   function downloadable(target, button) {
-    if (!taught()) return false;
     if (target.resp) return !!tokenForTurn(target.resp, target.slot);
     var card = target.key ? cardOrigin(target.key) : null;
     if (!card || !card.resp) return false;
@@ -5120,46 +5049,60 @@
       return cardIsPlain ? tokensOfTurn(card.resp) : [];
     }
 
-    // One after another until the rpc answers. A token it will not answer for
-    // is not a reason to reach for a key: the next token is the same road.
-    function askInTurn(tokens, i) {
+    // One token, all the way to the bytes. The rpc and the chain are one
+    // attempt, not two stages: a token the rpc answers for can still hand back
+    // a key the chain refuses with a 400, and stopping at the rpc's answer left
+    // that token's failure standing for the image while another token on the
+    // same turn would have delivered the file. Measured on a turn whose ledger
+    // rows had gone stale: the first token was refused outright, the second was
+    // answered with a key the chain would not serve.
+    function byToken(row) {
+      return originalByToken(row, row.conv || conv).then(function (key) {
+        noteDownload('the rpc answered, walking the download chain');
+        // The chain the lightbox walks, seeded the way the lightbox seeds it.
+        // Each hop's body is the next url and is used as it stands.
+        return followChain(seedUrl(key), 4);
+      });
+    }
+
+    function tryInTurn(tokens, i) {
       if (i >= tokens.length) {
         return Promise.reject(new Error(tokens.length
-          ? 'the download rpc answered for none of the tokens this image has'
+          ? 'none of the ' + tokens.length + ' token(s) this image has reached the file'
           : 'no token for this image'));
       }
-      return originalByToken(tokens[i], tokens[i].conv || conv).catch(function (err) {
+      return byToken(tokens[i]).catch(function (err) {
         if (i + 1 >= tokens.length) throw err;
         dbg('download: token ' + (i + 1) + ' of ' + tokens.length
-          + ' was not answered for (' + err.message + '), the next is tried');
-        return askInTurn(tokens, i + 1);
+          + ' did not reach the file (' + err.message + '), the next is tried');
+        return tryInTurn(tokens, i + 1);
       });
     }
 
-    function held() {
-      var tokens = tokensNow();
-      if (tokens.length) return Promise.resolve(tokens);
-      if (!conv) {
-        return Promise.reject(new Error('no token for this image and nothing names its conversation'));
-      }
-      // The conversation is where a token comes from; loading it is how the
-      // page itself came by the one its lightbox uses.
+    // A conversation reached by a full page load arrives inside the document
+    // rather than over an rpc, so §origins never sees it and the ledger keeps
+    // whatever an earlier sweep left. Those rows outlive the tokens they name,
+    // and a stale row is indistinguishable from a live one until it is spent.
+    // The reload is therefore the answer to a failure, not a precondition: the
+    // held rows are tried first because they usually work, and the conversation
+    // is asked for only once they have not.
+    function refreshed(tried) {
+      if (!conv) return Promise.reject(new Error('nothing names this image\'s conversation'));
+      noteDownload('the held tokens did not answer, reloading the conversation');
       return loadConversation(conv).then(function (payload) {
         rememberOrigins(payload, 'a load made for this download');
-        var late = tokensNow();
-        if (!late.length) throw new Error('the conversation no longer lists this image');
-        return late;
+        var late = tokensNow().filter(function (row) { return tried.indexOf(row.token) === -1; });
+        if (!late.length) throw new Error('the conversation lists no token this image has not already spent');
+        info('download: the conversation answered with ' + late.length + ' token(s) not tried yet');
+        return tryInTurn(late, 0);
       });
     }
 
-    held().then(function (tokens) {
-      noteDownload(tokens.length + ' token(s) held, asking the download rpc');
-      return askInTurn(tokens, 0);
-    }).then(function (key) {
-      noteDownload('the rpc answered, walking the download chain');
-      // The chain the lightbox walks, seeded the way the lightbox seeds it.
-      // Each hop's body is the next url and is used as it stands.
-      return followChain(seedUrl(key), 4);
+    var held = tokensNow();
+    noteDownload(held.length + ' token(s) held, asking the download rpc');
+    tryInTurn(held, 0).catch(function (err) {
+      dbg('download: the held tokens did not reach the file (' + err.message + ')');
+      return refreshed(held.map(function (row) { return row.token; }));
     }).then(function (blob) {
       noteDownload('fetched ' + blob.size + ' bytes, saving');
       saveBlob(blob, saveName(target.id, blob.type));
@@ -5194,7 +5137,6 @@
   // id - §origins keeps that index - and the ledger is written by turn as well
   // as by key, which is the same identity the download already falls back to.
   function markableCard(key) {
-    if (!taught()) return false;
     var card = cardOrigin(key);
     if (!card || !card.resp) return false;
     // More than one card names this turn, so which of its images this card
@@ -5242,7 +5184,7 @@
       var host = hosts[i];
       var named = /"(r_[0-9a-f]{16})"/.exec(host.getAttribute('jslog') || '');
       var slot = parseInt(host.getAttribute('data-image-attachment-index'), 10);
-      var known = !!(taught() && named && !isNaN(slot) && tokenForTurn(named[1], slot));
+      var known = !!(named && !isNaN(slot) && tokenForTurn(named[1], slot));
       var dot = host.querySelector(':scope > .gpie-origin-dot');
       if (known === !!dot) continue;
       if (!known) {
