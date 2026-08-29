@@ -67,7 +67,7 @@
   var WIZ_KEYS = { pctx: 'Ylro7b', pushId: 'qKIAYe', at: 'SNlM0e', bl: 'cfb2h', sid: 'FdrFJe' };
 
   // §config ==================================================================
-  var VERSION = '3.51.0';
+  var VERSION = '3.52.0';
 
   // Gemini keeps its own Update button disabled until the prompt text differs
   // from what the message already holds, so an image-only change cannot be
@@ -478,9 +478,34 @@
     return out;
   }
 
+  // An envelope whose payload is null is the call being answered and turned
+  // down, which is not the same as an answer carrying no envelope at all: a
+  // refusal names a request the server will not take, while a missing envelope
+  // is a session or a route that never reached the rpc. Read as 'no payload'
+  // the two are one failure, and the one that means "the body being sent is
+  // wrong" is the one worth naming.
+  //
+  //   [["wrb.fr","c8o8Fe",null,null,null,[3,null,[["....BardErrorInfo",[1003]]]],"generic"]
+  function wrbRefusal(text, rpcId) {
+    var head = '[["wrb.fr",' + (rpcId ? '"' + rpcId + '"' : 'null') + ',null';
+    if (text.indexOf(head) === -1) return null;
+    var code = /BardErrorInfo",\[(\d+)\]/.exec(text);
+    return (rpcId || 'ProcessFile') + ' answered, refusing the request'
+      + (code ? ' (error ' + code[1] + ')' : '');
+  }
+
   function wrbPayload(text, rpcId) {
     var all = wrbPayloads(text, rpcId);
-    if (!all.length) throw new Error('no ' + (rpcId || 'ProcessFile') + ' payload');
+    if (!all.length) {
+      var refused = wrbRefusal(text, rpcId);
+      if (refused) throw new Error(refused);
+      // A 200 holding no envelope says nothing on its own, and what the body
+      // does say is the only account of why. Without it the failure reads the
+      // same whatever the cause: a rotated shape and a signed-out session both
+      // answer 'no payload'.
+      throw new Error('no ' + (rpcId || 'ProcessFile') + ' payload; the answer was '
+        + text.length + ' chars: ' + text.replace(/\s+/g, ' ').slice(0, 200));
+    }
     return all[0];
   }
 

@@ -6,7 +6,7 @@
 // @license      MIT
 // @homepageURL  https://github.com/k0504/gemini-imgen-enhancer
 // @supportURL   https://github.com/k0504/gemini-imgen-enhancer/issues
-// @version      3.51.0
+// @version      3.52.0
 // @description  Force Gemini image generation onto Nano Banana Pro from the first request, and edit the images attached to an existing prompt.
 // @description:zh-TW  自首次請求即強制以 Nano Banana Pro 生成圖片，並可編輯既有 prompt 附加的圖片。
 // @match        https://gemini.google.com/*
@@ -136,7 +136,7 @@
   var WIZ_KEYS = { pctx: 'Ylro7b', pushId: 'qKIAYe', at: 'SNlM0e', bl: 'cfb2h', sid: 'FdrFJe' };
 
   // §config ==================================================================
-  var VERSION = '3.51.0';
+  var VERSION = '3.52.0';
 
   // Gemini keeps its own Update button disabled until the prompt text differs
   // from what the message already holds, so an image-only change cannot be
@@ -547,9 +547,34 @@
     return out;
   }
 
+  // An envelope whose payload is null is the call being answered and turned
+  // down, which is not the same as an answer carrying no envelope at all: a
+  // refusal names a request the server will not take, while a missing envelope
+  // is a session or a route that never reached the rpc. Read as 'no payload'
+  // the two are one failure, and the one that means "the body being sent is
+  // wrong" is the one worth naming.
+  //
+  //   [["wrb.fr","c8o8Fe",null,null,null,[3,null,[["....BardErrorInfo",[1003]]]],"generic"]
+  function wrbRefusal(text, rpcId) {
+    var head = '[["wrb.fr",' + (rpcId ? '"' + rpcId + '"' : 'null') + ',null';
+    if (text.indexOf(head) === -1) return null;
+    var code = /BardErrorInfo",\[(\d+)\]/.exec(text);
+    return (rpcId || 'ProcessFile') + ' answered, refusing the request'
+      + (code ? ' (error ' + code[1] + ')' : '');
+  }
+
   function wrbPayload(text, rpcId) {
     var all = wrbPayloads(text, rpcId);
-    if (!all.length) throw new Error('no ' + (rpcId || 'ProcessFile') + ' payload');
+    if (!all.length) {
+      var refused = wrbRefusal(text, rpcId);
+      if (refused) throw new Error(refused);
+      // A 200 holding no envelope says nothing on its own, and what the body
+      // does say is the only account of why. Without it the failure reads the
+      // same whatever the cause: a rotated shape and a signed-out session both
+      // answer 'no payload'.
+      throw new Error('no ' + (rpcId || 'ProcessFile') + ' payload; the answer was '
+        + text.length + ' chars: ' + text.replace(/\s+/g, ' ').slice(0, 200));
+    }
     return all[0];
   }
 
@@ -4370,6 +4395,11 @@
   // survive the visit to the conversation that produced them.
   var freqCache = Object.create(null);
 
+  // The download envelope this script put on the wire last. The capture hook
+  // sees it come by like any other and would file it as the page's own; the
+  // exact body is what tells the two apart.
+  var sentByUs = null;
+
   function storedFreq(store) {
     if (freqCache[store] !== undefined) return freqCache[store];
     try {
@@ -4429,7 +4459,18 @@
 
     // The lightbox's download, captured wherever it is pressed and persisted:
     // the library page never sends one of its own.
+    //
+    // This script's own replay goes out over the same transport and reaches
+    // this hook exactly as the page's does, so what it sent last is held and
+    // refused here. Without that the store learns from itself: a body this
+    // script composed was recorded as the page's, replayed on every later
+    // download, and kept being refused long after a press of the real button
+    // would have taught the shape that works.
     if (url.indexOf('rpcids=' + DOWNLOAD_RPC) !== -1) {
+      if (freq === sentByUs) {
+        dbg('library: this script\'s own download request, not recorded as a template');
+        return;
+      }
       keepFreq(STORE_DL_URL, url);
       if (keepFreq(STORE_DL_FREQ, freq)) {
         info('library: the lightbox download request was recorded, ' + freq.length + ' chars');
@@ -4662,28 +4703,27 @@
   //   f.req=<urlencoded [[["c8o8Fe","<inner>",null,"generic"]]]>&at=<csrf>&
   //
   // The inner array names the image: its media token, and the three ids of the
-  // turn it belongs to.
+  // turn it belongs to. Nothing of that shape is composed here. A body written
+  // from this description - the token and the three ids in an envelope of five
+  // positions - is refused by the server with `BardErrorInfo [1003]`, measured
+  // against the page's own body for the same image, which is answered. The
+  // envelope carries more than the values that name the image, so the page's
+  // own is replayed or nothing is sent at all.
   function originalByToken(row, conv) {
-    var inner = [
-      [[null, null, null, [null, null, null, null, null, row.token]],
-        null, null, null, null, null, null, null, null, null],
-      [row.resp, row.rc, 'c_' + conv, null, null],
-      1, 0, 1
-    ];
     var recorded = storedFreq(STORE_DL_FREQ);
-    var freq;
-    if (recorded) {
-      // The lightbox's own, which is what this is meant to be indistinguishable
-      // from. The composed one below stands in only until a download has been
-      // pressed once in a lightbox and recorded.
-      try {
-        freq = swapDownloadFreq(recorded, row, conv);
-      } catch (err) {
-        return Promise.reject(err);
-      }
-    } else {
-      freq = JSON.stringify([[[DOWNLOAD_RPC, JSON.stringify(inner), null, 'generic']]]);
+    if (!recorded) {
+      return Promise.reject(new Error('no download template yet; press a download'
+        + ' button once and the page teaches the shape'));
     }
+    var freq;
+    try {
+      freq = swapDownloadFreq(recorded, row, conv);
+    } catch (err) {
+      return Promise.reject(err);
+    }
+    // Held before the request goes out: the capture hook reads it on the way
+    // past, inside this same call.
+    sentByUs = freq;
     return rpcPost(rpcUrl(DOWNLOAD_RPC, conv), freq, DOWNLOAD_RPC, 'original by token')
       .then(function (payload) {
         var url = payload && payload[0];
@@ -5012,9 +5052,19 @@
   }
 
 
+  // Whether the page has taught the shape of a download request yet. Until it
+  // has there is no request to send, so a button taken here would answer
+  // nothing at all - and the press that teaches it is a press of the very
+  // button this would take. The first press on a fresh profile therefore goes
+  // to Gemini and costs the preview; every press after it answers the original.
+  function taught() {
+    return !!storedFreq(STORE_DL_FREQ);
+  }
+
   // The same question the mark answers: is there a media token for this image.
   // Nothing else is a reason to take a button.
   function downloadable(target, button) {
+    if (!taught()) return false;
     if (target.resp) return !!tokenForTurn(target.resp, target.slot);
     var card = target.key ? cardOrigin(target.key) : null;
     if (!card || !card.resp) return false;
@@ -5144,6 +5194,7 @@
   // id - §origins keeps that index - and the ledger is written by turn as well
   // as by key, which is the same identity the download already falls back to.
   function markableCard(key) {
+    if (!taught()) return false;
     var card = cardOrigin(key);
     if (!card || !card.resp) return false;
     // More than one card names this turn, so which of its images this card
@@ -5191,7 +5242,7 @@
       var host = hosts[i];
       var named = /"(r_[0-9a-f]{16})"/.exec(host.getAttribute('jslog') || '');
       var slot = parseInt(host.getAttribute('data-image-attachment-index'), 10);
-      var known = !!(named && !isNaN(slot) && tokenForTurn(named[1], slot));
+      var known = !!(taught() && named && !isNaN(slot) && tokenForTurn(named[1], slot));
       var dot = host.querySelector(':scope > .gpie-origin-dot');
       if (known === !!dot) continue;
       if (!known) {
