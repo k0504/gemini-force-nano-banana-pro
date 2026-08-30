@@ -72,7 +72,7 @@
   var WIZ_KEYS = { pctx: 'Ylro7b', pushId: 'qKIAYe', at: 'SNlM0e', bl: 'cfb2h', sid: 'FdrFJe' };
 
   // §config ==================================================================
-  var VERSION = '3.54.0';
+  var VERSION = '3.55.0';
 
   // Gemini keeps its own Update button disabled until the prompt text differs
   // from what the message already holds, so an image-only change cannot be
@@ -259,6 +259,92 @@
   // the next reader guessing which of the two it was.
   function reportDowngrade(what, why) {
     say('warn', LOG_IMG, 'degraded: ' + what + ' — ' + why);
+  }
+
+  // §guard ===================================================================
+  // What a value has to satisfy before anything downstream may read it. These
+  // throw. A value that fails one of them is not a slower version of the right
+  // value, it is the wrong value, and reporting it while carrying on is what
+  // this section exists to end: see §record's rule that the record, not the
+  // page, is what a message's attachment list means, and the failure that made
+  // it necessary - a thumbnail address that had become same-origin was fetched,
+  // answered 200 with Gemini's own HTML shell, passed the only test there was
+  // (response.ok) and reached the server declared as image/jpeg.
+  //
+  // Content-Type is what the other end says. The leading bytes are what the
+  // file is, so that is what is asked.
+
+  var IMAGE_SIGNATURES = [
+    { kind: 'image/jpeg', bytes: [0xFF, 0xD8, 0xFF] },
+    { kind: 'image/png', bytes: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] },
+    { kind: 'image/gif', bytes: [0x47, 0x49, 0x46, 0x38] }
+  ];
+
+  // RIFF....WEBP. The four bytes at offset 8 are what separate it from every
+  // other RIFF container, so both ends of the header are compared.
+  function isWebpHead(head) {
+    return head[0] === 0x52 && head[1] === 0x49 && head[2] === 0x46 && head[3] === 0x46
+      && head[8] === 0x57 && head[9] === 0x45 && head[10] === 0x42 && head[11] === 0x50;
+  }
+
+  function imageMimeOf(head) {
+    for (var i = 0; i < IMAGE_SIGNATURES.length; i++) {
+      var sig = IMAGE_SIGNATURES[i];
+      var hit = true;
+      for (var j = 0; j < sig.bytes.length; j++) {
+        if (head[j] !== sig.bytes[j]) { hit = false; break; }
+      }
+      if (hit) return sig.kind;
+    }
+    return isWebpHead(head) ? 'image/webp' : null;
+  }
+
+  // The header as something a reader can act on. `<!doctype html` names the
+  // failure outright, where "not an image" alone leaves the next person to
+  // fetch the URL by hand to find out what came back.
+  function describeHead(head) {
+    var text = '';
+    for (var i = 0; i < head.length && i < 16; i++) {
+      var c = head[i];
+      text += c >= 0x20 && c < 0x7F ? String.fromCharCode(c) : '.';
+    }
+    return JSON.stringify(text);
+  }
+
+  // Resolves with the mime the bytes actually are. Every caller writing an
+  // upload takes the mime from here rather than from blob.type, which carries
+  // whatever the response was labelled.
+  function mustBeImageBytes(blob, what) {
+    if (!blob || typeof blob.size !== 'number' || typeof blob.slice !== 'function') {
+      return Promise.reject(new Error(what + ': no bytes at all, got ' + typeof blob));
+    }
+    if (!blob.size) return Promise.reject(new Error(what + ': zero bytes'));
+    return blob.slice(0, 16).arrayBuffer().then(function (buf) {
+      var head = new Uint8Array(buf);
+      var mime = imageMimeOf(head);
+      if (!mime) {
+        throw new Error(what + ': not an image - ' + blob.size + ' bytes labelled '
+          + (blob.type || 'nothing') + ', starting ' + describeHead(head));
+      }
+      return mime;
+    });
+  }
+
+  // Where an image may be read from. lh3 is where every thumbnail Gemini
+  // renders lives; blob: and data: are this document's own mints. A
+  // same-origin address is never one: /app/<anything> answers 200 with the
+  // application shell, so appending a size suffix to one produces a perfectly
+  // valid-looking 840KB response that is not an image.
+  function mustBeImageSource(url, what) {
+    if (typeof url !== 'string' || !url) {
+      throw new Error(what + ': no source address to read the image from');
+    }
+    if (/^(blob:|data:)/.test(url)) return url;
+    if (!/^https:\/\/lh3\.(googleusercontent|google)\.com\//.test(url)) {
+      throw new Error(what + ': ' + url.slice(0, 80)
+        + ' is not an lh3 image address, nothing may be read from it');
+    }
+    return url;
   }
 
   // Reads an attachment list as `kind[length]:name`, which is enough to tell at

@@ -178,11 +178,23 @@
     return thumbKey(url) + '=s0';
   }
 
-  function fetchBytes(url) {
-    if (/^(blob:|data:)/.test(url)) {
-      return fetch(url).then(function (r) { return r.blob(); });
-    }
-    var full = thumbFullSize(url);
+  // The source is checked before the request is made and the bytes after it
+  // answers, and the two checks are deliberately on opposite sides of the
+  // transport fallback below: a response that arrived and is not an image is
+  // not a transport failure, and routing it into GM_xmlhttpRequest would ask
+  // the same address a second time and verify nothing about either answer.
+  function fetchBytes(url, what) {
+    mustBeImageSource(url, what);
+    var got = /^(blob:|data:)/.test(url)
+      ? fetch(url).then(function (r) { return r.blob(); })
+      : fetchOverNetwork(thumbFullSize(url));
+    return got.then(function (blob) {
+      return mustBeImageBytes(blob, what + ' fetched from ' + String(url).slice(0, 80))
+        .then(function () { return blob; });
+    });
+  }
+
+  function fetchOverNetwork(full) {
     return fetch(full, { mode: 'cors' }).then(function (r) {
       if (!r.ok) throw new Error('http ' + r.status);
       return r.blob();
@@ -206,9 +218,11 @@
     });
   }
 
-  function fallbackName(index) {
-    return 'image-' + (index + 1) + '.jpg';
-  }
+  // fallbackName is gone on purpose. It answered a missing name with
+  // image-<n>.jpg, and the name handed to an upload is the name the server
+  // keeps from then on, so the one branch in this file whose cost was not time
+  // was quietly destroying the user's file names. A name that cannot be
+  // established stops the entry instead: see serverName.
 
   // Asked for at most once per plan, and only when the plan has no record to
   // read names from. Opening edit mode and closing it again asks for nothing.
@@ -230,34 +244,44 @@
     var known = p.base && p.base[entry.index];
     if (known && typeof known[1] === 'string' && known[1]) return Promise.resolve(known[1]);
     var pending = planNames(p);
-    // The only branch in this file whose cost is not time. The name handed to
-    // the upload becomes the name the resent message carries, so falling back
-    // here renames the user's file to image-<n>.jpg on the server for good -
-    // there is no later pass that puts the original back.
+    // The name handed to the upload becomes the name the resent message carries
+    // from then on, and no later pass puts the original back. So this is a
+    // stop, not a report: the entry gets no fresh attachment, planIsReady stays
+    // false, and Update never unlocks - the user keeps a message whose files
+    // still have their own names instead of a resend that renamed them.
+    //
+    // Rejected rather than thrown: the caller invokes this directly rather than
+    // from inside a then, so a synchronous throw would escape the per-entry
+    // catch in freshenExisting and take the whole plan's freshen pass with it.
     if (!pending) {
-      reportDowngrade('original file name lost for existing#' + entry.index
-        + ', re-uploading as ' + fallbackName(entry.index)
-        + ' — the server keeps that name permanently',
-        'no record name and no server name for this thumbnail');
-      return Promise.resolve(fallbackName(entry.index));
+      return Promise.reject(new Error('existing#' + entry.index
+        + ': no record name, and no thumbnail this conversation can be asked about, '
+        + 'so the original file name cannot be established'));
     }
     return pending.then(function (byThumb) {
       var found = byThumb && byThumb[thumbKey(entry.thumb)];
       if (!found) {
-        dbg('freshen: existing#' + entry.index, 'the server reports no name for this thumbnail');
-        reportDowngrade('original file name lost for existing#' + entry.index
-          + ', re-uploading as ' + fallbackName(entry.index)
-          + ' — the server keeps that name permanently',
-          'no record name and no server name for this thumbnail');
+        throw new Error('existing#' + entry.index
+          + ': the server reports no name for this thumbnail, so the original file '
+          + 'name cannot be established');
       }
-      return found || fallbackName(entry.index);
+      return found;
     });
   }
 
+  // Where every byte source in this pipeline meets the server: a refetched
+  // thumbnail, a file the user dropped, and bytes read back out of the store
+  // all arrive here. The mime goes out as what the bytes are, never as
+  // blob.type, which is only what whoever produced them said they were - and
+  // the entry adopts the bytes only once they have passed, so a bad set is not
+  // kept to be re-sent on the next edit without a fetch.
   function uploadInto(entry, bytes, name, why) {
-    dbg('freshen: existing#' + entry.index, why, bytes.size + 'B');
-    entry.bytes = bytes;
-    return uploadFile(new File([bytes], name, { type: bytes.type || 'image/jpeg' }))
+    return mustBeImageBytes(bytes, 'existing#' + entry.index + ' (' + name + ')')
+      .then(function (mime) {
+        dbg('freshen: existing#' + entry.index, why, bytes.size + 'B', mime);
+        entry.bytes = bytes;
+        return uploadFile(new File([bytes], name, { type: mime }));
+      })
       .then(function (tuple) {
         entry.freshAttachment = tuple;
         dbg('freshen: existing#' + entry.index, 'fresh contrib ready');
@@ -295,7 +319,7 @@
         dbg('freshen: existing#' + entry.index, 'no bytes held, refetching from',
           String(entry.thumb).slice(0, 60));
         noteFetchStart();
-        return fetchBytes(entry.thumb).then(function (blob) {
+        return fetchBytes(entry.thumb, 'existing#' + entry.index).then(function (blob) {
           noteFetchEnd();
           return uploadInto(entry, blob, name, 'refetched,');
         });
