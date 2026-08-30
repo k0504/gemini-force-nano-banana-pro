@@ -47,7 +47,6 @@ const state = {
   record: null,
   lastIndex: 0,
   stale: [],
-  downgrades: [],
   refusals: []
 };
 
@@ -58,7 +57,6 @@ const api = load(['nativeRetryContribution'], {
   ACTION_RETRY: 5,
   ACTION_RETRY_PRO: 7,
   dbg: function () { },
-  reportDowngrade: function (what, why) { state.downgrades.push(what + ' | ' + why); },
   // The refusal channel §resend reads. Recording it is what these tests assert
   // against: the unit's job is to raise it, and rewrite() is what turns a
   // raised refusal into a request that never goes out.
@@ -94,7 +92,6 @@ function reset(record, opts) {
   state.record = record;
   state.lastIndex = (opts && opts.lastIndex !== undefined) ? opts.lastIndex : 0;
   state.stale = (opts && opts.stale) || [];
-  state.downgrades = [];
   state.refusals = [];
 }
 
@@ -158,8 +155,8 @@ it('leaves the page list alone when the message has no record', function () {
   const inner = send(5, ['from-page.png']);
   assert.strictEqual(api.nativeRetryContribution(inner), null);
   assert.deepStrictEqual(inner[0][3].map((a) => a[1]), ['from-page.png']);
-  assert.deepStrictEqual(state.downgrades, [], 'no record is not a downgrade, it is a message this script never resent');
-  assert.deepStrictEqual(state.refusals, [], 'and it is not a reason to refuse the send either');
+  assert.deepStrictEqual(state.refusals, [],
+    'no record is not a defect, it is a message this script never resent, so nothing is refused');
 });
 
 // Both of the cases below used to let the request through with the list the
@@ -176,7 +173,6 @@ it('refuses the send when the record and the regenerate disagree on length', fun
   assert.strictEqual(state.refusals.length, 1, 'the send is refused');
   assert.ok(/1 attachments against the 2/.test(state.refusals[0]),
     'the refusal names both counts: ' + state.refusals[0]);
-  assert.strictEqual(state.downgrades.length, 0, 'and it is not reported as a degraded send');
 });
 
 it('refuses the send when the record holds uploads it cannot vouch for', function () {
@@ -186,7 +182,6 @@ it('refuses the send when the record holds uploads it cannot vouch for', functio
   assert.strictEqual(state.refusals.length, 1, 'the send is refused');
   assert.ok(/reopen the message and resend it/.test(state.refusals[0]),
     'the refusal says what will clear it: ' + state.refusals[0]);
-  assert.strictEqual(state.downgrades.length, 0, 'and it is not reported as a degraded send');
 });
 
 it('leaves a regenerate that carries no attachments alone', function () {

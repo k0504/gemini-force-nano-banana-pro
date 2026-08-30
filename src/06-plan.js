@@ -116,8 +116,11 @@
       // nothing was staged, the next send is usually an unrelated composer
       // message, and a warning there would name a loss that never happened.
       if (planIsDirty(plan)) {
-        reportDowngrade('edit plan expired unsent, its changes are dropped',
-          'message #' + plan.index);
+        // The user's staged edit, gone. Nothing incorrect is sent by it - the
+        // plan simply stops existing - but what was staged is not recoverable,
+        // so it is said at error level rather than dressed up as a cost.
+        say('error', LOG_IMG, 'the edit staged on message #' + plan.index
+          + ' expired unsent and its changes are dropped');
       } else {
         dbg('activePlan: plan #' + plan.index + ' expired unsent with nothing staged');
       }
@@ -401,12 +404,18 @@
       return entry.kind === 'existing' ? !entry.freshAttachment : !entry.attachment;
     }).length;
     var count = Array.isArray(base) ? base.length : 0;
+    // Both of these used to leave the list untouched and let the send go. What
+    // it went with was the page's list - the images from before this message
+    // was last resent - so neither was leaving anything untouched: they were
+    // replacing the user's images with older ones. There is no correct list to
+    // write in either case, so there is nothing to send.
     if (missing) {
-      say('warn', LOG_IMG, 'attachments left untouched:', missing,
-        'of them have nothing to be written from');
+      refuseSend(missing + ' of the attachments for message #' + p.index
+        + ' have nothing to be written from');
     } else if (count !== p.originalCount) {
-      say('warn', LOG_IMG, 'attachment count mismatch, attachments left untouched',
-        { base: count, ui: p.originalCount });
+      refuseSend('the record for message #' + p.index + ' holds ' + count
+        + ' attachments against the ' + p.originalCount + ' the editor opened with, '
+        + 'so which list to write cannot be established');
     } else {
       tuple[ATTACHMENTS] = p.entries.map(function (entry) {
         // Two elements, the shape the page itself sends for a new upload. The
@@ -453,27 +462,31 @@
   // turn rather than a new one; a native send inside an existing conversation
   // carries the other elements and not this one. Dropping it alone answers in
   // 2.0s to first byte, against 21.3s for the same send with it left in.
-  function chooseSendShape(inner, written, hasNew) {
+  // Answers whether the send may go out. hasNew is gone with the route that
+  // read it: it decided how much of the fast shape was still worth applying to
+  // a list that could not have all of it, and there is no such list any more.
+  function chooseSendShape(inner, written, p) {
     var allContrib = Array.isArray(written) && written.length > 0
       && written.every(function (att) { return attClass(att) === 'contrib-live'; });
     work.images = Array.isArray(written) ? written.length : 0;
     work.shape = allContrib ? 'brand-new upload shape' : 'edit resend';
 
     if (!allContrib) {
-      // Something in the list is a server reference, or a contrib this document
-      // cannot vouch for, so the send cannot take the shape above and goes out
-      // as the edit resend it is. Clearing the action alone is still worth it
-      // when an upload is present, that combination being the slowest thing the
-      // server answers.
-      if (hasNew) inner[ACTION_INDEX] = null;
-      dbg('chooseSendShape: not every attachment is contrib-live, sent as an edit resend |',
-        attShape(written));
-      // The timing table above is what the user is paying here, so it is quoted
-      // rather than described: this is the one decision in the send path whose
-      // cost is a minute of waiting the user cannot account for otherwise.
-      reportDowngrade('brand-new upload shape abandoned, sent as edit resend '
-        + '(measured 79.9s vs 24.2s)', attShape(written));
-      return;
+      // Unreachable by construction, and refused rather than sent because of
+      // it. freshenExisting re-uploads every existing entry that is not already
+      // a live contrib of this document, planIsReady holds Update closed until
+      // each one has its fresh attachment, and applyPlanTo writes the list from
+      // those and nothing else - so a list arriving here with anything else in
+      // it means one of those three stopped holding.
+      //
+      // This used to send it as an edit resend instead: correct, and 79.9s
+      // against 24.2s. A slow path that exists is a slow path that gets taken,
+      // and one taken silently is indistinguishable from the fast one until the
+      // user is a minute into waiting. There is no reason to keep a route to a
+      // state that cannot legitimately occur.
+      refuseSend('the attachment list for message #' + p.index + ' is not all uploads this '
+        + 'document made, which the editor should have made impossible: ' + attShape(written));
+      return false;
     }
 
     inner[ACTION_INDEX] = null;
@@ -484,12 +497,14 @@
     dbg('chooseSendShape: brand-new upload shape in this conversation,',
       hadResume ? 'resume blob dropped' : 'no resume blob to drop', '| conversation',
       (Array.isArray(convTuple) && convTuple[0]) || '(none)');
-    // Nothing is returned. A shape decision reaches its readers two ways: through
-    // work.shape, which report() prints, and through inner, which is rewritten
-    // in place. A future shape that clears the conversation tuple must also set
-    // pendingStrip the way applyStripProbe does, or §net never arms the response
-    // patch and the page navigates to /app on the first chunk - a failure that
-    // shows as a navigation rather than an exception, so a test that only diffs
-    // the request body passes straight through it.
+    // True is only "this send may go out": the shape itself reaches its readers
+    // two other ways, through work.shape, which report() prints, and through
+    // inner, which is rewritten in place. A future shape that clears the
+    // conversation tuple must also set pendingStrip the way applyStripProbe
+    // does, or §net never arms the response patch and the page navigates to
+    // /app on the first chunk - a failure that shows as a navigation rather
+    // than an exception, so a test that only diffs the request body passes
+    // straight through it.
+    return true;
   }
 

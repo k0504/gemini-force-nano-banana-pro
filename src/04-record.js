@@ -744,7 +744,13 @@
       // landed found no record and took the request body as its base - the
       // stale list §shape exists to avoid. A clean plan is thrown away and the
       // next scan pass builds it again off the record; a dirty one is holding
-      // the user's edit, so it is kept and the cost is named instead.
+      // the user's edit, so it is kept - but it is kept blocked. Naming the
+      // cost and leaving it to send was the same trade every other route in
+      // this file used to make: the send would have gone out with the list from
+      // before this message was last resent, and the report would have said so
+      // after the fact. Blocked, the press refuses and reopening the editor
+      // rebuilds the plan off the record, which is a few seconds against a
+      // resend that silently used the wrong images.
       //
       // Judged against the plan's own conversation, not the one on screen. This
       // block runs after a store read, so it runs after a route change too, and
@@ -755,8 +761,11 @@
       if (plan && plan.path === location.pathname && !plan.base
         && overrideAtPath(plan.index, plan.path)) {
         if (planIsDirty(plan)) {
-          reportDowngrade('edit built before its record loaded, its send may carry a stale list',
-            'message #' + plan.index + ' of ' + plan.path);
+          plan.blocked = 'this edit was built before the message\'s record had loaded, so the '
+            + 'list it would send is the one from before the last resend — close the editor '
+            + 'and reopen it';
+          say('error', LOG_IMG, 'message #' + plan.index + ' of ' + plan.path
+            + ' cannot be resent: ' + plan.blocked);
         } else {
           discardPlan();
         }
@@ -1018,16 +1027,16 @@
     // Falling back to the live read defeats the point of being handed a pinned
     // id: both callers defer across an rpc, and the conversation on screen when
     // the answer is wanted need not be the one the question was asked about.
-    var id = conv;
-    if (!id) {
-      id = conversationId();
-      if (id) {
-        reportDowngrade(label + ' reads whichever conversation is on screen',
-          'it was given no conversation id to pin to');
-      }
+    // No live read stands in for a missing pin. Asking whichever conversation
+    // happens to be on screen answers a question nobody asked: for namesByThumb
+    // that is a name map from another thread, every thumbnail missing from it,
+    // and a permanent rename for each; for refreshOverride it is an upgrade
+    // aimed at a turn that is not there. Both are worse than not answering.
+    if (!conv) {
+      return Promise.reject(new Error(label
+        + ' was given no conversation id to pin to, and the one on screen is not it'));
     }
-    if (!id) return Promise.reject(new Error('no conversation on screen'));
-    return batchExecute(LIST_CONVERSATION_RPC, [id, 10, null, 1, [1], [4], null, 1], label);
+    return batchExecute(LIST_CONVERSATION_RPC, [conv, 10, null, 1, [1], [4], null, 1], label);
   }
 
   // A thumbnail URL identifies one attachment, which a file name does not: the
@@ -1082,8 +1091,10 @@
       o ? o.attachments.length : 0, 'attachments, attempt', attempt,
       '(record ' + (o ? 'found' : 'MISSING') + ')');
     if (!o) {
-      reportDowngrade('reference upgrade dropped, later resends of this message stay slow',
-        'message #' + index + ' has no record left to upgrade');
+      // Not a loss and not a degradation: with no record there is nothing that
+      // could be upgraded and nothing that will be resent from one. It was
+      // reported as a cost the user was paying, which it never was.
+      dbg('refreshOverride: message #' + index + ' has no record left to upgrade');
       return;
     }
     // One separator for both sides of the comparison. It was a space on one
@@ -1121,9 +1132,12 @@
       // what follows would replace that send's own list with the tokens of the
       // turn the server has just been asked about and then destroy its bytes.
       if (!current || current.gen !== gen) {
-        reportDowngrade('reference upgrade dropped, later resends of this message stay slow',
-          'message #' + index + ' was rewritten while the upgrade was in flight (generation '
-          + gen + ' -> ' + (current ? current.gen : 'gone') + ')');
+        // The guard doing its job, not a cost: a second send rewrote this
+        // record while the rpc was out, and what stands is that send's own
+        // list. Upgrading it here would replace it with the tokens of the turn
+        // the server was asked about and then destroy its bytes.
+        dbg('refreshOverride: message #' + index + ' was rewritten while the upgrade was in '
+          + 'flight (generation ' + gen + ' -> ' + (current ? current.gen : 'gone') + ')');
         return;
       }
       current.attachments = tuples.map(function (t) {

@@ -151,8 +151,10 @@
       }
       var kept = applyPlanTo(inner, p);
       // The same reading of that return as the route below: null means this
-      // send is not the one the plan was made for, so it is left alone.
+      // send is not the one the plan was made for, so it is left alone, and
+      // false means applyPlanTo has refused it.
       if (kept === null) return null;
+      if (!kept) return null;
       dbg('editorContribution: retry, attachments left as they stand',
         kept ? '(written from the record)' : '(as the page built them)');
       var reload = commitSend(p, inner[PROMPT_TUPLE][ATTACHMENTS], kept);
@@ -201,21 +203,17 @@
         }).join(', '));
     }
 
-    var hasNew = p.entries.some(function (entry) { return entry.kind === 'new'; });
-
     var listWritten = applyPlanTo(inner, p);
     if (listWritten === null) return null;
+    // False is no longer a send that goes out with the page's list; applyPlanTo
+    // has refused it, and rewrite() reads that. Nothing is committed, because
+    // nothing departs and the server discards no turns.
+    if (!listWritten) return null;
 
-    if (listWritten) {
-      dbg(dirty ? 'attachments rewritten' : 'attachments restored',
-        p.originalCount, '->', p.entries.length);
-      // Only a list this script wrote can be reshaped; the one the page built
-      // is left in the shape the page chose for it.
-      chooseSendShape(inner, inner[PROMPT_TUPLE][ATTACHMENTS], hasNew);
-    }
-    // Outside the gate, like the retry route: a send that backed out of the
-    // list is still an edit resend, and still discards the turns after this
-    // one. commitSend is what reads the verdict.
+    dbg(dirty ? 'attachments rewritten' : 'attachments restored',
+      p.originalCount, '->', p.entries.length);
+    if (!chooseSendShape(inner, inner[PROMPT_TUPLE][ATTACHMENTS], p)) return null;
+
     var reload = commitSend(p, inner[PROMPT_TUPLE][ATTACHMENTS], listWritten);
 
     plan = null;

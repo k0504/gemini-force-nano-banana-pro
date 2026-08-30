@@ -319,16 +319,16 @@
     say.apply(null, ['log', LOG_IMG].concat(Array.prototype.slice.call(arguments)));
   }
 
-  // The channel every abandonment reports through. A branch that gives up the
-  // fast shape, throws a dirty plan away or renames a user's file charges the
-  // user something they never asked for - 55s, or a file name the server then
-  // keeps - and dbg() is off by default, so a branch that reports only there
-  // reports to nobody. Both halves are the point: `what` is the cost paid,
-  // `why` is the condition that failed, and a report missing either one leaves
-  // the next reader guessing which of the two it was.
-  function reportDowngrade(what, why) {
-    say('warn', LOG_IMG, 'degraded: ' + what + ' — ' + why);
-  }
+  // reportDowngrade is gone. It was the channel through which a branch that
+  // gave up the fast shape, sent the page's attachment list in place of the
+  // record's, or renamed a user's file announced what it had just charged
+  // them - and having somewhere respectable to announce it is what made each
+  // of those branches look like a decision rather than a defect. Every one of
+  // them is now a refusal: see §guard for what a value has to be, §durable for
+  // what a record has to be, and §resend for the send that does not go out
+  // when either fails. What remains after that is either an error the user has
+  // to act on, which is said at error level, or a step worth tracing, which is
+  // dbg's.
 
   // §guard ===================================================================
   // What a value has to satisfy before anything downstream may read it. These
@@ -1558,7 +1558,13 @@
       // landed found no record and took the request body as its base - the
       // stale list §shape exists to avoid. A clean plan is thrown away and the
       // next scan pass builds it again off the record; a dirty one is holding
-      // the user's edit, so it is kept and the cost is named instead.
+      // the user's edit, so it is kept - but it is kept blocked. Naming the
+      // cost and leaving it to send was the same trade every other route in
+      // this file used to make: the send would have gone out with the list from
+      // before this message was last resent, and the report would have said so
+      // after the fact. Blocked, the press refuses and reopening the editor
+      // rebuilds the plan off the record, which is a few seconds against a
+      // resend that silently used the wrong images.
       //
       // Judged against the plan's own conversation, not the one on screen. This
       // block runs after a store read, so it runs after a route change too, and
@@ -1569,8 +1575,11 @@
       if (plan && plan.path === location.pathname && !plan.base
         && overrideAtPath(plan.index, plan.path)) {
         if (planIsDirty(plan)) {
-          reportDowngrade('edit built before its record loaded, its send may carry a stale list',
-            'message #' + plan.index + ' of ' + plan.path);
+          plan.blocked = 'this edit was built before the message\'s record had loaded, so the '
+            + 'list it would send is the one from before the last resend — close the editor '
+            + 'and reopen it';
+          say('error', LOG_IMG, 'message #' + plan.index + ' of ' + plan.path
+            + ' cannot be resent: ' + plan.blocked);
         } else {
           discardPlan();
         }
@@ -1832,16 +1841,16 @@
     // Falling back to the live read defeats the point of being handed a pinned
     // id: both callers defer across an rpc, and the conversation on screen when
     // the answer is wanted need not be the one the question was asked about.
-    var id = conv;
-    if (!id) {
-      id = conversationId();
-      if (id) {
-        reportDowngrade(label + ' reads whichever conversation is on screen',
-          'it was given no conversation id to pin to');
-      }
+    // No live read stands in for a missing pin. Asking whichever conversation
+    // happens to be on screen answers a question nobody asked: for namesByThumb
+    // that is a name map from another thread, every thumbnail missing from it,
+    // and a permanent rename for each; for refreshOverride it is an upgrade
+    // aimed at a turn that is not there. Both are worse than not answering.
+    if (!conv) {
+      return Promise.reject(new Error(label
+        + ' was given no conversation id to pin to, and the one on screen is not it'));
     }
-    if (!id) return Promise.reject(new Error('no conversation on screen'));
-    return batchExecute(LIST_CONVERSATION_RPC, [id, 10, null, 1, [1], [4], null, 1], label);
+    return batchExecute(LIST_CONVERSATION_RPC, [conv, 10, null, 1, [1], [4], null, 1], label);
   }
 
   // A thumbnail URL identifies one attachment, which a file name does not: the
@@ -1896,8 +1905,10 @@
       o ? o.attachments.length : 0, 'attachments, attempt', attempt,
       '(record ' + (o ? 'found' : 'MISSING') + ')');
     if (!o) {
-      reportDowngrade('reference upgrade dropped, later resends of this message stay slow',
-        'message #' + index + ' has no record left to upgrade');
+      // Not a loss and not a degradation: with no record there is nothing that
+      // could be upgraded and nothing that will be resent from one. It was
+      // reported as a cost the user was paying, which it never was.
+      dbg('refreshOverride: message #' + index + ' has no record left to upgrade');
       return;
     }
     // One separator for both sides of the comparison. It was a space on one
@@ -1935,9 +1946,12 @@
       // what follows would replace that send's own list with the tokens of the
       // turn the server has just been asked about and then destroy its bytes.
       if (!current || current.gen !== gen) {
-        reportDowngrade('reference upgrade dropped, later resends of this message stay slow',
-          'message #' + index + ' was rewritten while the upgrade was in flight (generation '
-          + gen + ' -> ' + (current ? current.gen : 'gone') + ')');
+        // The guard doing its job, not a cost: a second send rewrote this
+        // record while the rpc was out, and what stands is that send's own
+        // list. Upgrading it here would replace it with the tokens of the turn
+        // the server was asked about and then destroy its bytes.
+        dbg('refreshOverride: message #' + index + ' was rewritten while the upgrade was in '
+          + 'flight (generation ' + gen + ' -> ' + (current ? current.gen : 'gone') + ')');
         return;
       }
       current.attachments = tuples.map(function (t) {
@@ -2216,8 +2230,11 @@
       // nothing was staged, the next send is usually an unrelated composer
       // message, and a warning there would name a loss that never happened.
       if (planIsDirty(plan)) {
-        reportDowngrade('edit plan expired unsent, its changes are dropped',
-          'message #' + plan.index);
+        // The user's staged edit, gone. Nothing incorrect is sent by it - the
+        // plan simply stops existing - but what was staged is not recoverable,
+        // so it is said at error level rather than dressed up as a cost.
+        say('error', LOG_IMG, 'the edit staged on message #' + plan.index
+          + ' expired unsent and its changes are dropped');
       } else {
         dbg('activePlan: plan #' + plan.index + ' expired unsent with nothing staged');
       }
@@ -2501,12 +2518,18 @@
       return entry.kind === 'existing' ? !entry.freshAttachment : !entry.attachment;
     }).length;
     var count = Array.isArray(base) ? base.length : 0;
+    // Both of these used to leave the list untouched and let the send go. What
+    // it went with was the page's list - the images from before this message
+    // was last resent - so neither was leaving anything untouched: they were
+    // replacing the user's images with older ones. There is no correct list to
+    // write in either case, so there is nothing to send.
     if (missing) {
-      say('warn', LOG_IMG, 'attachments left untouched:', missing,
-        'of them have nothing to be written from');
+      refuseSend(missing + ' of the attachments for message #' + p.index
+        + ' have nothing to be written from');
     } else if (count !== p.originalCount) {
-      say('warn', LOG_IMG, 'attachment count mismatch, attachments left untouched',
-        { base: count, ui: p.originalCount });
+      refuseSend('the record for message #' + p.index + ' holds ' + count
+        + ' attachments against the ' + p.originalCount + ' the editor opened with, '
+        + 'so which list to write cannot be established');
     } else {
       tuple[ATTACHMENTS] = p.entries.map(function (entry) {
         // Two elements, the shape the page itself sends for a new upload. The
@@ -2553,27 +2576,31 @@
   // turn rather than a new one; a native send inside an existing conversation
   // carries the other elements and not this one. Dropping it alone answers in
   // 2.0s to first byte, against 21.3s for the same send with it left in.
-  function chooseSendShape(inner, written, hasNew) {
+  // Answers whether the send may go out. hasNew is gone with the route that
+  // read it: it decided how much of the fast shape was still worth applying to
+  // a list that could not have all of it, and there is no such list any more.
+  function chooseSendShape(inner, written, p) {
     var allContrib = Array.isArray(written) && written.length > 0
       && written.every(function (att) { return attClass(att) === 'contrib-live'; });
     work.images = Array.isArray(written) ? written.length : 0;
     work.shape = allContrib ? 'brand-new upload shape' : 'edit resend';
 
     if (!allContrib) {
-      // Something in the list is a server reference, or a contrib this document
-      // cannot vouch for, so the send cannot take the shape above and goes out
-      // as the edit resend it is. Clearing the action alone is still worth it
-      // when an upload is present, that combination being the slowest thing the
-      // server answers.
-      if (hasNew) inner[ACTION_INDEX] = null;
-      dbg('chooseSendShape: not every attachment is contrib-live, sent as an edit resend |',
-        attShape(written));
-      // The timing table above is what the user is paying here, so it is quoted
-      // rather than described: this is the one decision in the send path whose
-      // cost is a minute of waiting the user cannot account for otherwise.
-      reportDowngrade('brand-new upload shape abandoned, sent as edit resend '
-        + '(measured 79.9s vs 24.2s)', attShape(written));
-      return;
+      // Unreachable by construction, and refused rather than sent because of
+      // it. freshenExisting re-uploads every existing entry that is not already
+      // a live contrib of this document, planIsReady holds Update closed until
+      // each one has its fresh attachment, and applyPlanTo writes the list from
+      // those and nothing else - so a list arriving here with anything else in
+      // it means one of those three stopped holding.
+      //
+      // This used to send it as an edit resend instead: correct, and 79.9s
+      // against 24.2s. A slow path that exists is a slow path that gets taken,
+      // and one taken silently is indistinguishable from the fast one until the
+      // user is a minute into waiting. There is no reason to keep a route to a
+      // state that cannot legitimately occur.
+      refuseSend('the attachment list for message #' + p.index + ' is not all uploads this '
+        + 'document made, which the editor should have made impossible: ' + attShape(written));
+      return false;
     }
 
     inner[ACTION_INDEX] = null;
@@ -2584,13 +2611,15 @@
     dbg('chooseSendShape: brand-new upload shape in this conversation,',
       hadResume ? 'resume blob dropped' : 'no resume blob to drop', '| conversation',
       (Array.isArray(convTuple) && convTuple[0]) || '(none)');
-    // Nothing is returned. A shape decision reaches its readers two ways: through
-    // work.shape, which report() prints, and through inner, which is rewritten
-    // in place. A future shape that clears the conversation tuple must also set
-    // pendingStrip the way applyStripProbe does, or §net never arms the response
-    // patch and the page navigates to /app on the first chunk - a failure that
-    // shows as a navigation rather than an exception, so a test that only diffs
-    // the request body passes straight through it.
+    // True is only "this send may go out": the shape itself reaches its readers
+    // two other ways, through work.shape, which report() prints, and through
+    // inner, which is rewritten in place. A future shape that clears the
+    // conversation tuple must also set pendingStrip the way applyStripProbe
+    // does, or §net never arms the response patch and the page navigates to
+    // /app on the first chunk - a failure that shows as a navigation rather
+    // than an exception, so a test that only diffs the request body passes
+    // straight through it.
+    return true;
   }
 
   // §resend ==================================================================
@@ -2746,8 +2775,10 @@
       }
       var kept = applyPlanTo(inner, p);
       // The same reading of that return as the route below: null means this
-      // send is not the one the plan was made for, so it is left alone.
+      // send is not the one the plan was made for, so it is left alone, and
+      // false means applyPlanTo has refused it.
       if (kept === null) return null;
+      if (!kept) return null;
       dbg('editorContribution: retry, attachments left as they stand',
         kept ? '(written from the record)' : '(as the page built them)');
       var reload = commitSend(p, inner[PROMPT_TUPLE][ATTACHMENTS], kept);
@@ -2796,21 +2827,17 @@
         }).join(', '));
     }
 
-    var hasNew = p.entries.some(function (entry) { return entry.kind === 'new'; });
-
     var listWritten = applyPlanTo(inner, p);
     if (listWritten === null) return null;
+    // False is no longer a send that goes out with the page's list; applyPlanTo
+    // has refused it, and rewrite() reads that. Nothing is committed, because
+    // nothing departs and the server discards no turns.
+    if (!listWritten) return null;
 
-    if (listWritten) {
-      dbg(dirty ? 'attachments rewritten' : 'attachments restored',
-        p.originalCount, '->', p.entries.length);
-      // Only a list this script wrote can be reshaped; the one the page built
-      // is left in the shape the page chose for it.
-      chooseSendShape(inner, inner[PROMPT_TUPLE][ATTACHMENTS], hasNew);
-    }
-    // Outside the gate, like the retry route: a send that backed out of the
-    // list is still an edit resend, and still discards the turns after this
-    // one. commitSend is what reads the verdict.
+    dbg(dirty ? 'attachments rewritten' : 'attachments restored',
+      p.originalCount, '->', p.entries.length);
+    if (!chooseSendShape(inner, inner[PROMPT_TUPLE][ATTACHMENTS], p)) return null;
+
     var reload = commitSend(p, inner[PROMPT_TUPLE][ATTACHMENTS], listWritten);
 
     plan = null;

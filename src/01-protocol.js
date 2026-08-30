@@ -250,16 +250,16 @@
     say.apply(null, ['log', LOG_IMG].concat(Array.prototype.slice.call(arguments)));
   }
 
-  // The channel every abandonment reports through. A branch that gives up the
-  // fast shape, throws a dirty plan away or renames a user's file charges the
-  // user something they never asked for - 55s, or a file name the server then
-  // keeps - and dbg() is off by default, so a branch that reports only there
-  // reports to nobody. Both halves are the point: `what` is the cost paid,
-  // `why` is the condition that failed, and a report missing either one leaves
-  // the next reader guessing which of the two it was.
-  function reportDowngrade(what, why) {
-    say('warn', LOG_IMG, 'degraded: ' + what + ' — ' + why);
-  }
+  // reportDowngrade is gone. It was the channel through which a branch that
+  // gave up the fast shape, sent the page's attachment list in place of the
+  // record's, or renamed a user's file announced what it had just charged
+  // them - and having somewhere respectable to announce it is what made each
+  // of those branches look like a decision rather than a defect. Every one of
+  // them is now a refusal: see §guard for what a value has to be, §durable for
+  // what a record has to be, and §resend for the send that does not go out
+  // when either fails. What remains after that is either an error the user has
+  // to act on, which is said at error level, or a step worth tracing, which is
+  // dbg's.
 
   // §guard ===================================================================
   // What a value has to satisfy before anything downstream may read it. These
