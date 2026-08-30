@@ -2512,26 +2512,46 @@
   }
 
   // §resend ==================================================================
-  // A send this script declines to write, on a message whose resend still
-  // discards every turn after it. The list goes out as the page built it; the
-  // records for the discarded turns go with them either way, so the commit is
-  // owed whether or not anything was written. Leaving before it is what left
-  // them behind as orphans for syncOverrides to draw over unrelated messages.
+  // Set by any route that finds it cannot write a correct attachment list, and
+  // read by rewrite(), which then refuses the request outright instead of
+  // returning a body.
+  var pendingRefusal = null;
+
+  // A send this script cannot write correctly does not go out.
   //
+  // This used to let the request through with the list the page had built. That
+  // list is the one the message held before its last resend - §record exists to
+  // state exactly that - so letting it through does not degrade the send, it
+  // sends the user's older images in place of the ones on screen, silently and
+  // irreversibly. There is no slower-but-correct version of this to fall back
+  // to, so there is nothing to fall back to.
+  //
+  // Nothing is committed and no record is discarded: the send is not made, so
+  // the server truncates nothing and there are no later turns to account for.
+  // The plan and the editor are left standing too - the usual cause is a press
+  // that beat the upload, and the next press a few seconds later succeeds.
+  function refuseSend(why) {
+    pendingRefusal = why;
+    say('error', LOG_IMG, 'send refused, nothing was sent: ' + why);
+    return null;
+  }
+
+  // The one shape a refused rewrite answers with. The original body travels
+  // back with it so nothing downstream has to special-case a missing one; no
+  // transport reads it, because every transport checks `refuse` first.
+  function refusalResult(body) {
+    return { body: body, reload: false, refresh: null, strip: null, refuse: pendingRefusal };
+  }
+
   // Only when the send really is the resend: a plan left idling while the user
-  // types into the composer would otherwise arm a truncation hold against a
-  // message that send never touched.
+  // types into the composer describes a message this send never touched, so it
+  // has no standing to refuse it.
   function backOut(inner, p, why) {
     if (!isEditResend(inner)) {
       dbg('editorContribution: backing out -', why, '- and this send is not the resend');
       return null;
     }
-    reportDowngrade('the attachment list goes out as the page built it, and the turns after '
-      + 'this message are discarded with their records', why);
-    commitSend(p, inner[PROMPT_TUPLE][ATTACHMENTS], false);
-    plan = null;
-    teardownEditorUi();
-    return null;
+    return refuseSend(why);
   }
 
   // §native-retry ============================================================
@@ -2575,25 +2595,25 @@
       return null;
     }
     if (base.length !== body.length) {
-      reportDowngrade('regenerate sent with the list the page built, which is the one from '
-        + 'before this message was last resent',
-        'the record for message #' + index + ' holds ' + base.length
-        + ' attachments against the ' + body.length + ' the send carries');
-      return null;
+      return refuseSend('the record for message #' + index + ' holds ' + base.length
+        + ' attachments against the ' + body.length + ' this regenerate carries, so which '
+        + 'images it would generate from cannot be established');
     }
     // An upload the server has already collected fails the send outright, and
     // there is no plan here to re-upload it from: this runs inside
-    // XMLHttpRequest.send and an upload is three round trips. The page's list is
-    // stale but it resolves, so it is left to stand and what that costs is
-    // named rather than traded for a send that cannot go out at all.
+    // XMLHttpRequest.send and an upload is three round trips. What used to
+    // happen here was to let the page's list stand because it resolves - but
+    // what it resolves to is the images from before this message was last
+    // resent, so the regenerate answered a message the user is no longer
+    // looking at. Refused instead: reopen the message and resend it, which
+    // re-uploads the images and leaves references this document can vouch for.
     var stale = base.filter(function (att) {
       return attClass(att) === 'contrib-stale';
     }).length;
     if (stale) {
-      reportDowngrade('regenerate sent with the list the page built, which is the one from '
-        + 'before this message was last resent',
-        stale + ' of the record\'s attachments are uploads this document cannot vouch for');
-      return null;
+      return refuseSend(stale + ' of the record\'s attachments for message #' + index
+        + ' are uploads this document cannot vouch for; reopen the message and resend it '
+        + 'before regenerating');
     }
 
     tuple[ATTACHMENTS] = base;
@@ -2848,7 +2868,7 @@
   // Returns { body, reload, refresh, strip }; body is the original string when
   // nothing applied.
   function rewrite(url, body) {
-    var unchanged = { body: body, reload: false, refresh: null, strip: null };
+    var unchanged = { body: body, reload: false, refresh: null, strip: null, refuse: null };
     if (typeof url !== 'string' || url.indexOf('StreamGenerate') === -1) return unchanged;
     dbg('rewrite: StreamGenerate intercepted, body', typeof body === 'string' ? body.length + ' chars' : typeof body);
     if (typeof body !== 'string') return unchanged;
@@ -2879,6 +2899,7 @@
       var reload = false;
       pendingRefresh = null;
       pendingStrip = null;
+      pendingRefusal = null;
 
       // The sentinel must never reach the server, plan or no plan: a retry of
       // a message without attachments unlocks Update with no plan armed, so
@@ -2896,6 +2917,10 @@
       }
 
       var attachmentsChanged = editorContribution(inner);
+      // Ahead of everything else this function still had to do. A refusal is
+      // not a body, so nothing below it - the shape probe, the serialise, the
+      // hold the transport would claim - has anything to act on.
+      if (pendingRefusal) return refusalResult(body);
       if (attachmentsChanged !== null) {
         changed = true;
         reload = attachmentsChanged;
@@ -2913,6 +2938,22 @@
       dbg('rewrite: reload =', reload + ', refresh =', JSON.stringify(pendingRefresh));
       return { body: newBody, reload: reload, refresh: pendingRefresh, strip: pendingStrip };
     } catch (e) {
+      // A send with a plan armed against it is one this script owes an
+      // attachment list, and passing it through unwritten sends the list the
+      // page built - the images from before this message was last resent. That
+      // is the loss, not a degraded version of avoiding it, so it is refused.
+      //
+      // Everything else does go through. A composer message has no image state
+      // at stake, and refusing every send because the body format moved would
+      // take Gemini away from the user entirely to protect a message that has
+      // nothing to protect. `plan` is read directly rather than through
+      // activePlan(), which expires what it reads: this is an error path and
+      // must not be the thing that discards the user's staged edit.
+      if (plan) {
+        refuseSend('the request body could not be read, and this message has an edit staged '
+          + 'that would otherwise be sent as the page built it (' + e + ')');
+        return refusalResult(body);
+      }
       say('warn', LOG_PRO, 'rewrite skipped:', e);
       return unchanged;
     }
@@ -3136,6 +3177,12 @@
     // §origins reads the answers this page gets wherever they go by.
     tapRpcXhr(this, this.__gemUrl);
     var result = rewrite(this.__gemUrl, body);
+    // Before anything that would record this send as having departed. Throwing
+    // is what tells the page the request did not happen: swallowing the refusal
+    // and returning would leave it waiting for an answer that is never coming,
+    // and calling through would send the very list the refusal exists to stop.
+    // The reason is already on the console, from refuseSend.
+    if (result.refuse) throw new Error('[gpie] send refused: ' + result.refuse);
     if (typeof this.__gemUrl === 'string' && this.__gemUrl.indexOf('StreamGenerate') !== -1) {
       dbg('xhr: sending StreamGenerate, body', result.body === body ? 'untouched' : 'rewritten');
       keepBody(this.__gemUrl, result.body, result.body !== body);
@@ -3216,6 +3263,9 @@
       } catch (e) {
         say('warn', LOG_PRO, 'fetch hook skipped:', e);
       }
+      // Outside the try, or the throw below would be caught by the handler
+      // meant for the rewrite itself and the refused send would go out anyway.
+      if (result && result.refuse) throw new Error('[gpie] send refused: ' + result.refuse);
       var promise = tapRpcFetch(url, nativeFetch.call(this, input, init));
       // Nothing on this path traces the stream, so a send is settled on its own
       // response. Only a send: any other fetch resolving first would settle a

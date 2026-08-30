@@ -47,7 +47,8 @@ const state = {
   record: null,
   lastIndex: 0,
   stale: [],
-  downgrades: []
+  downgrades: [],
+  refusals: []
 };
 
 const api = load(['nativeRetryContribution'], {
@@ -58,6 +59,10 @@ const api = load(['nativeRetryContribution'], {
   ACTION_RETRY_PRO: 7,
   dbg: function () { },
   reportDowngrade: function (what, why) { state.downgrades.push(what + ' | ' + why); },
+  // The refusal channel §resend reads. Recording it is what these tests assert
+  // against: the unit's job is to raise it, and rewrite() is what turns a
+  // raised refusal into a request that never goes out.
+  refuseSend: function (why) { state.refusals.push(why); return null; },
   attShape: function (list) { return Array.isArray(list) ? list.map((a) => a[1]).join(', ') : String(list); },
   attClass: function (att) {
     return state.stale.indexOf(att[1]) === -1 ? 'token' : 'contrib-stale';
@@ -90,6 +95,7 @@ function reset(record, opts) {
   state.lastIndex = (opts && opts.lastIndex !== undefined) ? opts.lastIndex : 0;
   state.stale = (opts && opts.stale) || [];
   state.downgrades = [];
+  state.refusals = [];
 }
 
 let failures = 0;
@@ -153,22 +159,34 @@ it('leaves the page list alone when the message has no record', function () {
   assert.strictEqual(api.nativeRetryContribution(inner), null);
   assert.deepStrictEqual(inner[0][3].map((a) => a[1]), ['from-page.png']);
   assert.deepStrictEqual(state.downgrades, [], 'no record is not a downgrade, it is a message this script never resent');
+  assert.deepStrictEqual(state.refusals, [], 'and it is not a reason to refuse the send either');
 });
 
-it('refuses to guess when the record and the send disagree on length', function () {
+// Both of the cases below used to let the request through with the list the
+// page had built. That list is the one the message held before its last
+// resend, so the regenerate answered images the user had already replaced.
+// They refuse now: there is no correct list to write and no slower way to
+// arrive at one, so nothing is sent.
+it('refuses the send when the record and the regenerate disagree on length', function () {
   reset([token('one.png')]);
   const inner = send(5, ['one.png', 'two.png']);
   assert.strictEqual(api.nativeRetryContribution(inner), null);
-  assert.deepStrictEqual(inner[0][3].map((a) => a[1]), ['one.png', 'two.png']);
-  assert.strictEqual(state.downgrades.length, 1, 'the loss is named');
+  assert.deepStrictEqual(inner[0][3].map((a) => a[1]), ['one.png', 'two.png'],
+    'the body is left as it was; the refusal is what stops it, not a rewrite');
+  assert.strictEqual(state.refusals.length, 1, 'the send is refused');
+  assert.ok(/1 attachments against the 2/.test(state.refusals[0]),
+    'the refusal names both counts: ' + state.refusals[0]);
+  assert.strictEqual(state.downgrades.length, 0, 'and it is not reported as a degraded send');
 });
 
-it('leaves the page list alone when the record holds uploads it cannot vouch for', function () {
+it('refuses the send when the record holds uploads it cannot vouch for', function () {
   reset([contrib('dead.jpg')], { stale: ['dead.jpg'] });
   const inner = send(5, ['from-page.png']);
   assert.strictEqual(api.nativeRetryContribution(inner), null);
-  assert.deepStrictEqual(inner[0][3].map((a) => a[1]), ['from-page.png']);
-  assert.strictEqual(state.downgrades.length, 1, 'the loss is named');
+  assert.strictEqual(state.refusals.length, 1, 'the send is refused');
+  assert.ok(/reopen the message and resend it/.test(state.refusals[0]),
+    'the refusal says what will clear it: ' + state.refusals[0]);
+  assert.strictEqual(state.downgrades.length, 0, 'and it is not reported as a degraded send');
 });
 
 it('leaves a regenerate that carries no attachments alone', function () {
