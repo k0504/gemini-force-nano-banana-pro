@@ -22,6 +22,13 @@
     });
     var base = recordAttachments(index);
     var baseBlobs = recordBlobs(index);
+    // Asked as edit mode opens, so a message that cannot be resent says so
+    // while the user is still deciding rather than on the press. See §durable
+    // for what puts a record in this state; none of it is repairable from here.
+    var blocked = recordBlocker(index, location.pathname);
+    if (blocked) {
+      say('error', LOG_IMG, 'message #' + index + ' cannot be resent: ' + blocked);
+    }
     var entries = thumbs.map(function (thumb, i) {
       return { kind: 'existing', index: i, thumb: thumb };
     });
@@ -44,6 +51,7 @@
       path: location.pathname,
       base: base,
       baseBlobs: baseBlobs,
+      blocked: blocked,
       originalCount: thumbs.length,
       originalThumbs: thumbs.slice(),
       entries: entries,
@@ -91,6 +99,9 @@
   // edit mode opens, so by the time anything has been changed they are usually
   // already done.
   function planIsReady(p) {
+    // A record that cannot be trusted is not made ready by finishing the
+    // uploads: what the list would be written from is the thing in doubt.
+    if (p.blocked) return false;
     return p.entries.every(function (entry) {
       return entry.kind === 'existing' ? entry.freshAttachment : entry.attachment;
     });
@@ -296,6 +307,12 @@
   }
 
   function freshenExisting(p) {
+    // Nothing is uploaded for a plan that cannot be sent. The re-uploads exist
+    // to make the press fast, and this plan has no press to be fast for.
+    if (p.blocked) {
+      dbg('freshen: message #' + p.index + ' is blocked, nothing is uploaded -', p.blocked);
+      return;
+    }
     p.entries.forEach(function (entry) {
       if (entry.kind !== 'existing' || entry.freshAttachment || entry.freshPending) return;
       entry.freshPending = true;

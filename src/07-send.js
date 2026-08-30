@@ -123,6 +123,12 @@
     var dirty = planIsDirty(p);
     dbg('editorContribution: plan #' + p.index + ', dirty =', dirty + ', record =', !!p.base);
 
+    // Ahead of every route below, including the retry's. What those routes
+    // write the list from is the record, and this is the case where the record
+    // is the thing in doubt - see §durable. Its own message is used rather than
+    // the not-ready gate's, which would report uploads that are not the reason.
+    if (p.blocked) return backOut(inner, p, p.blocked);
+
     // A retry changes no image, so nothing below it applies: the attachments go
     // out as the references they already are - the record's if it has one,
     // since the body Gemini builds for a message it has resent is the one from

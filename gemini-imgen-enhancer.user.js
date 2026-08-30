@@ -1049,7 +1049,10 @@
         overrides.splice(overrides.indexOf(o), 1);
       }
       dbDelete(RECORDS, [snap.path + '#' + snap.index]).catch(function (err) {
-        say('warn', LOG_IMG, 'could not discard the record of a send that failed:', err);
+        // The row describes a list that was never sent. Left on file it is what
+        // the next edit of that message reads as the message's own.
+        markRecordUnsafe(snap.index, snap.path,
+          'the record of a send that never departed could not be discarded (' + err + ')');
       });
       return;
     }
@@ -1107,8 +1110,11 @@
       row.savedAt = Date.now();
       return dbWrite(RECORDS, [row]);
     }).catch(function (err) {
-      say('warn', LOG_IMG, 'could not put back the record of a send that failed at #'
-        + snap.index + ' of ' + snap.path + ':', err);
+      // The rollback is what makes a failed send leave nothing behind. Without
+      // it the store holds the list that send would have written, and the send
+      // never happened.
+      markRecordUnsafe(snap.index, snap.path,
+        'the record of a send that never departed could not be put back (' + err + ')');
     });
     // The array does not take these URLs over, and the snapshot left
     // departedSends before this ran, so nothing else is left to free them.
@@ -1152,9 +1158,13 @@
         'later records discarded with it');
       return dbDelete(RECORDS, keys);
     }).catch(function (err) {
-      // Named rather than swallowed: what survives a failure here is a record
-      // describing a turn the server no longer has, which the next visit draws
-      // over whichever message has taken that ordinal.
+      // What survives a failure here is a record describing a turn the server
+      // no longer has, and the next visit draws it over whichever message has
+      // taken that ordinal. Which message that will be is not knowable from
+      // here, so the doubt is over the store as a whole rather than over any
+      // one row.
+      markStoreUntrusted('the records of turns discarded by a resend of message #' + index
+        + ' of ' + path + ' are still on file (' + err + ')');
       say('warn', LOG_IMG, 'could not discard the records after #' + index
         + ' of ' + path + ':', err);
     });
@@ -1223,6 +1233,10 @@
           + ((held - freed) / 1048576).toFixed(1) + 'MB kept');
       });
     }).catch(function (err) {
+      // The one write failure in this file that leaves nothing describing
+      // anything false: pruning only frees space, so a failed prune means the
+      // store stays larger than its budget and every record still says exactly
+      // what it said before. Nothing is marked, because nothing is in doubt.
       say('warn', LOG_IMG, 'could not prune the stored images:', err);
     });
   }
@@ -1238,6 +1252,46 @@
   // leaves everything above it alone. The conversation is part of the key as
   // well, or the same position in another thread would inherit the list.
   var overrides = [];
+
+  // §durable =================================================================
+  // The store is what a message's attachment list means after a reload. A write
+  // that failed therefore leaves the page and the store describing different
+  // messages, and the next edit is built from whichever one it happens to read.
+  //
+  // These failures used to print a warning and carry on. Carrying on is the
+  // part that was wrong: nothing downstream repairs a record that was never
+  // written, so the warning described a divergence that then went on to decide
+  // a send. What is marked here refuses instead - every plan built on it, and
+  // every plan at all while the store itself is in doubt. A reload rebuilds
+  // from the server, which is the one source that was never in question.
+  //
+  // Both marks live in memory only, and deliberately so: they exist because
+  // writing to the store failed, so the store is the one place they cannot be
+  // kept.
+  var storeUntrusted = null;
+
+  function markStoreUntrusted(why) {
+    if (storeUntrusted) return;
+    storeUntrusted = why;
+    say('error', LOG_IMG, 'the attachment records are no longer trustworthy: ' + why
+      + ' — no message can be resent from this page until it is reloaded');
+  }
+
+  function markRecordUnsafe(index, path, why) {
+    var o = overrideAtPath(index, path);
+    if (o) o.unsafe = why;
+    say('error', LOG_IMG, 'message #' + index + ' of ' + path + ' cannot be resent: ' + why
+      + ' — reload the page to rebuild it from the server');
+  }
+
+  // What stops a plan before it is built, or null. Read by §plan when edit mode
+  // opens, so the refusal arrives while the user is still deciding rather than
+  // on the press.
+  function recordBlocker(index, path) {
+    if (storeUntrusted) return storeUntrusted;
+    var o = overrideAtPath(index, path);
+    return o && o.unsafe ? o.unsafe : null;
+  }
 
   function hostsNow() {
     return document.querySelectorAll('div.user-query-container');
@@ -1407,7 +1461,13 @@
       });
       dbg('persistOverrides:', records.length, 'records stored with', images, 'images');
     }).catch(function (err) {
-      say('warn', LOG_IMG, 'could not persist the attachment records:', err);
+      // Each record this write was carrying, by name. The send itself already
+      // went out and was correct; what failed is the part that makes it mean
+      // anything after a reload, so it is the next edit of these messages that
+      // has to stop, not this one.
+      records.forEach(function (r) {
+        markRecordUnsafe(r.index, r.path, 'its record could not be stored (' + err + ')');
+      });
     });
   }
 
@@ -1518,7 +1578,12 @@
     }).catch(function (err) {
       // Resolving, not rethrowing: the prune chained onto this reads the store
       // for itself and has no reason to be skipped because the restore failed.
-      say('warn', LOG_IMG, 'could not restore the attachment records:', err);
+      //
+      // But nothing may be resent after it. With no records read, every message
+      // this script has resent looks to the editor like one it never touched,
+      // so its plan would be built from the page's list - the images from
+      // before that resend.
+      markStoreUntrusted('the attachment records could not be read (' + err + ')');
     });
   }
 
@@ -2057,6 +2122,13 @@
     });
     var base = recordAttachments(index);
     var baseBlobs = recordBlobs(index);
+    // Asked as edit mode opens, so a message that cannot be resent says so
+    // while the user is still deciding rather than on the press. See §durable
+    // for what puts a record in this state; none of it is repairable from here.
+    var blocked = recordBlocker(index, location.pathname);
+    if (blocked) {
+      say('error', LOG_IMG, 'message #' + index + ' cannot be resent: ' + blocked);
+    }
     var entries = thumbs.map(function (thumb, i) {
       return { kind: 'existing', index: i, thumb: thumb };
     });
@@ -2079,6 +2151,7 @@
       path: location.pathname,
       base: base,
       baseBlobs: baseBlobs,
+      blocked: blocked,
       originalCount: thumbs.length,
       originalThumbs: thumbs.slice(),
       entries: entries,
@@ -2126,6 +2199,9 @@
   // edit mode opens, so by the time anything has been changed they are usually
   // already done.
   function planIsReady(p) {
+    // A record that cannot be trusted is not made ready by finishing the
+    // uploads: what the list would be written from is the thing in doubt.
+    if (p.blocked) return false;
     return p.entries.every(function (entry) {
       return entry.kind === 'existing' ? entry.freshAttachment : entry.attachment;
     });
@@ -2331,6 +2407,12 @@
   }
 
   function freshenExisting(p) {
+    // Nothing is uploaded for a plan that cannot be sent. The re-uploads exist
+    // to make the press fast, and this plan has no press to be fast for.
+    if (p.blocked) {
+      dbg('freshen: message #' + p.index + ' is blocked, nothing is uploaded -', p.blocked);
+      return;
+    }
     p.entries.forEach(function (entry) {
       if (entry.kind !== 'existing' || entry.freshAttachment || entry.freshPending) return;
       entry.freshPending = true;
@@ -2635,6 +2717,12 @@
 
     var dirty = planIsDirty(p);
     dbg('editorContribution: plan #' + p.index + ', dirty =', dirty + ', record =', !!p.base);
+
+    // Ahead of every route below, including the retry's. What those routes
+    // write the list from is the record, and this is the case where the record
+    // is the thing in doubt - see §durable. Its own message is used rather than
+    // the not-ready gate's, which would report uploads that are not the reason.
+    if (p.blocked) return backOut(inner, p, p.blocked);
 
     // A retry changes no image, so nothing below it applies: the attachments go
     // out as the references they already are - the record's if it has one,
