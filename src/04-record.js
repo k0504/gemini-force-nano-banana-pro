@@ -387,6 +387,56 @@
     return overrides.some(function (o) { return o.path === path; });
   }
 
+  // Records written before §guard existed, and any a future defect writes. Two
+  // things are asked of each one, and they fail independently:
+  //
+  //   the attachments say what the server was told each file was. One that is
+  //   not an image means the server is holding a file in place of a reference
+  //   image, which no resend from here can undo - the message needs that image
+  //   replaced by hand.
+  //
+  //   the bytes are what a resend would upload. Bytes that are not an image
+  //   are dropped rather than kept for uploadInto to refuse one at a time, and
+  //   because leaving them is what let one poisoned set survive every later
+  //   resend.
+  //
+  // Both mark the record, because either one means the message on screen is not
+  // the message a resend would produce.
+  function verifyStoredRecords() {
+    var checks = [];
+    // Which conversations actually lost bytes. persistOverrides stamps savedAt,
+    // which §store reads as least-recently-used, so writing back a record that
+    // did not change would age another conversation's out of the store for
+    // nothing.
+    var rewrite = {};
+    overrides.forEach(function (o) {
+      (o.attachments || []).forEach(function (att, i) {
+        var mime = att && att[0] && att[0][3];
+        if (typeof mime === 'string' && mime.indexOf('image/') !== 0) {
+          markRecordUnsafe(o.index, o.path, 'attachment ' + (i + 1) + ' was uploaded as '
+            + mime + ', so the server holds a file there and not an image; replace that '
+            + 'image by hand');
+        }
+      });
+      (o.blobs || []).forEach(function (blob, i) {
+        if (!blob) return;
+        checks.push(mustBeImageBytes(blob, 'the stored bytes of attachment ' + (i + 1)
+          + ' of message #' + o.index).catch(function (err) {
+            o.blobs[i] = null;
+            rewrite[o.path] = true;
+            markRecordUnsafe(o.index, o.path, String(err.message || err)
+              + '; those bytes have been dropped');
+            return null;
+          }));
+      });
+    });
+    if (!checks.length) return Promise.resolve(null);
+    return Promise.all(checks).then(function () {
+      Object.keys(rewrite).forEach(persistOverrides);
+      return null;
+    });
+  }
+
   function pruneStore() {
     return dbReadAll(RECORDS).then(function (rows) {
       var held = 0;
