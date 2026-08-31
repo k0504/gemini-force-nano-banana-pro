@@ -3,10 +3,12 @@
   // only sign a different page is on screen. Read from the scan pass rather
   // than from history: a route change rebuilds the view, so a pass is already
   // on its way, and nothing of the page's own has to be wrapped.
-  var lastPath = location.pathname;
+  // Read through the account segment, so switching account on the same page is
+  // not a route change and a conversation reached by either address is one page.
+  var lastPath = appPath();
   function watchRoute() {
-    if (location.pathname === lastPath) return;
-    lastPath = location.pathname;
+    if (appPath() === lastPath) return;
+    lastPath = appPath();
     // A hold still unclaimed at a route change belongs to a send that never
     // departed - the only way one survives to here is the retry arming by hand
     // and the Update press failing - and it must not be claimed by the next

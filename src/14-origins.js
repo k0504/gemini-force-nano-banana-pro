@@ -58,6 +58,43 @@
     return resp + '#' + slot;
   }
 
+  // §origins:account ---------------------------------------------------------
+  // The ledger is one store for gemini.google.com, and a second signed-in
+  // account shares it: the taps read what the requests carry and no request
+  // says which account made it, so both accounts' tokens land in the same
+  // place. That is harmless to a lookup - a turn is only ever reached through
+  // the listing of the account that owns it - and fatal to the prune, which
+  // deletes every row the listing it just read does not name. Read as one
+  // library, the other account's images are images that have been deleted.
+  //
+  // So each row says whose it is, and the prune judges only its own.
+  //
+  // Two answers, and which one is in hand is part of the answer. The address is
+  // the account's position in the switcher, which moves when an account is
+  // signed out; the page's own datum is the account itself and does not. The
+  // datum sits behind an obfuscated build symbol that can be renamed under us,
+  // so the address is the fallback rather than the source - and a row written
+  // under one is never compared against a row written under the other, which
+  // costs a rename nothing more than a prune that stops retiring old rows.
+  //
+  // Folded rather than stored: the ledger is readable by anything on this
+  // origin, and which images are whose is all this has to answer.
+  function accountHere() {
+    var mail = wiz(WIZ_KEYS.acct);
+    if (typeof mail === 'string' && mail.indexOf('@') !== -1) {
+      var fold = 5381;
+      for (var i = 0; i < mail.length; i++) {
+        fold = ((fold * 33) ^ mail.charCodeAt(i)) >>> 0;
+      }
+      return 'e:' + fold.toString(16);
+    }
+    // Measured against two accounts on one browser: /library and /u/0/library
+    // are served the same account, so the bare address is the first one and not
+    // a third state.
+    var numbered = /^\/u\/(\d+)(?=\/|$)/.exec(location.pathname);
+    return 'u:' + (numbered ? numbered[1] : '0');
+  }
+
   // The ledger's size as an attribute, which survives where a log line does
   // not: it answers "is the ledger filling" for a page opened long after the
   // lines scrolled past, and for a driver that attached after load. §log now
@@ -405,12 +442,16 @@
       dbg('origins: the tokens could not be read (' + err.message + ')');
       return;
     }
+    var here = accountHere();
     var fresh = [];
     rows.forEach(function (row) {
       var at = turnSlot(row.resp, row.slot);
       if (turnTokens[at] && turnTokens[at].token === row.token) return;
       row.key = 'tok:' + at;
       row.conv = conv;
+      // Whose turn this is, written at the only moment it is known: the answer
+      // being read was served to whoever is signed in now. See §origins:account.
+      row.acct = here;
       holdToken(row);
       fresh.push(row);
     });
@@ -499,11 +540,51 @@
   // Only against a listing read to its end. A harvest that stopped early has
   // seen some of the library, and pruning against that would throw away tokens
   // for cards it simply never reached.
+  // Every row this script already holds was written before the account was
+  // recorded, and none of them is ever rewritten: rememberTokens skips a token
+  // already held, so nothing on the reading side would ever stamp one and the
+  // prune below - which judges only rows it can place - would be inert for good
+  // on exactly the ledger it exists to keep.
+  //
+  // The listing places them. A turn it names is a turn this account owns, which
+  // is the same fact the prune reads in the negative, so adopting on it costs no
+  // request and no new assumption. Only the turns it names: a row it is silent
+  // about is a row this listing cannot speak for, and taking those would hand
+  // the other account's ledger to whichever library happened to be read first.
+  //
+  // Written back rather than held, or the next document reads them unplaced and
+  // the adoption has to happen again on every load.
+  function adoptListed(standing) {
+    var here = accountHere();
+    var taken = [];
+    for (var at in turnTokens) {
+      var row = turnTokens[at];
+      if (row.acct || !standing[row.resp]) continue;
+      row.acct = here;
+      taken.push(row);
+    }
+    if (!taken.length) return 0;
+    dbWrite(ORIGINS, taken).then(function () {
+      dbg('origins:', taken.length, 'tokens placed with the account that listed them');
+    }).catch(function (err) {
+      say('warn', LOG_IMG, 'the tokens could not be placed with their account:', err);
+    });
+    return taken.length;
+  }
+
+  // Only ever against the account whose listing was read. A row belonging to
+  // another account is absent from this listing because this listing could not
+  // have named it, and a row from before the account was recorded cannot be
+  // placed at all - neither is evidence of a deleted card, and the deletion is
+  // permanent where the evidence is not. Both are left for a listing read while
+  // signed in as their owner, which is the only reading that can retire them.
   function pruneVanished(standing) {
+    var here = accountHere();
     var gone = [];
     for (var at in turnTokens) {
       var row = turnTokens[at];
       if (standing[row.resp]) continue;
+      if (row.acct !== here) continue;
       gone.push(row);
     }
     if (!gone.length) return 0;
@@ -676,9 +757,13 @@
       // a harvest that stopped early and one that found nothing read the same
       // to anyone who was not watching the console while it ran.
       var named = Object.keys(knownConvs).length - known;
+      // Both read the same listing, and both only from one read to its end: a
+      // harvest that stopped early has seen some of the library, and neither
+      // what it names nor what it omits speaks for the pages it never reached.
+      var placed = why === 'read to the end' ? adoptListed(standing) : 0;
       var dropped = why === 'read to the end' ? pruneVanished(standing) : 0;
       var told = pages + ' pages, ' + cards + ' cards, ' + indexed + ' indexed, '
-        + named + ' named, ' + dropped + ' dropped, ' + why;
+        + named + ' named, ' + placed + ' placed, ' + dropped + ' dropped, ' + why;
       var node = document.getElementById('gpie-style');
       if (node) node.setAttribute('data-harvest', told);
       info('origins: ' + told);
@@ -718,7 +803,7 @@
   var indexedAt = 0;
 
   function indexLibrary() {
-    if (location.pathname.indexOf('/library') !== 0) return;
+    if (appPath().indexOf('/library') !== 0) return;
     // `harvested` no longer serves as this guard, since it now says a harvest
     // has happened at some point rather than that one is under way.
     if (harvesting) return;
@@ -749,7 +834,7 @@
     }
     // The library is the one page that can say which conversations matter, so
     // it is read first and the sweep follows on what it found.
-    if (location.pathname.indexOf('/library') === 0 && !harvested) {
+    if (appPath().indexOf('/library') === 0 && !harvested) {
       harvested = true;
       indexedAt = Date.now();
       // The harvest is an optimisation, not a precondition: the ids it looks

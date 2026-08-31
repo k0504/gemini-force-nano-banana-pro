@@ -592,7 +592,7 @@
   }
 
   function overrideAt(index) {
-    return overrideAtPath(index, location.pathname);
+    return overrideAtPath(index, appPath());
   }
 
   // One counter for every record this document writes, rather than a count
@@ -717,7 +717,7 @@
   // is already in the store and restoreOverrides reads it back on return. The
   // in-flight dbWrite holds its own snapshot and is unaffected.
   function releaseOffPath() {
-    var here = location.pathname;
+    var here = appPath();
     for (var i = overrides.length - 1; i >= 0; i--) {
       var o = overrides[i];
       if (o.path === here) continue;
@@ -766,13 +766,20 @@
   function restoreOverrides() {
     releaseOffPath();
     return dbReadAll(RECORDS).then(function (kept) {
-      var mine = kept.filter(function (r) { return r && r.path === location.pathname; });
+      // Both sides read through the account segment. A record written while
+      // /u/1/app/<id> was on screen is a record of this conversation, and
+      // comparing the stored path literally lost it to a switch that changed
+      // nothing about the thread. Rows stored in either form match from here on;
+      // what is held in memory is the read-through form alone, which is what
+      // every comparison after this one uses.
+      var here = appPath();
+      var mine = kept.filter(function (r) { return r && appPath(r.path) === here; });
       if (!mine.length) return;
       mine.forEach(function (r) {
-        if (overrideAtPath(r.index, r.path)) return;
+        if (overrideAtPath(r.index, here)) return;
         var blobs = Array.isArray(r.blobs) ? r.blobs : [];
         overrides.push({
-          path: r.path,
+          path: here,
           index: r.index,
           // Bytes are the only thumb that survives a document. Records written
           // by an earlier version still carry lh3 URLs, and they are dropped
@@ -808,7 +815,7 @@
       // in an always-on report - on the ordinary act of clicking another
       // conversation in the sidebar. A report the user learns to ignore is
       // worse than none.
-      if (plan && plan.path === location.pathname && !plan.base
+      if (plan && plan.path === appPath() && !plan.base
         && overrideAtPath(plan.index, plan.path)) {
         if (planIsDirty(plan)) {
           plan.blocked = 'this edit was built before the message\'s record had loaded, so the '
@@ -1005,7 +1012,7 @@
     for (var i = 0; i < overrides.length; i++) {
       var o = overrides[i];
       if (o.view && !o.view.isConnected) o.view = null;
-      if (o.path !== location.pathname) {
+      if (o.path !== appPath()) {
         dropView(o);
         continue;
       }

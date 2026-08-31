@@ -25,7 +25,7 @@
     // Asked as edit mode opens, so a message that cannot be resent says so
     // while the user is still deciding rather than on the press. See §durable
     // for what puts a record in this state; none of it is repairable from here.
-    var blocked = recordBlocker(index, location.pathname);
+    var blocked = recordBlocker(index, appPath());
     if (blocked) {
       say('error', LOG_IMG, 'message #' + index + ' cannot be resent: ' + blocked);
     }
@@ -48,7 +48,7 @@
       // an rpc is asked by conversation id, and the two are not interchangeable.
       // Anything judging this plan after an await needs to know which thread it
       // belongs to rather than which one is on screen by then.
-      path: location.pathname,
+      path: appPath(),
       base: base,
       baseBlobs: baseBlobs,
       blocked: blocked,

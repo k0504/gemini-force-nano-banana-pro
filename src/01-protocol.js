@@ -69,7 +69,13 @@
 
   // WIZ_global_data keys the page exposes. They are obfuscated build symbols, so
   // values sniffed off live requests take precedence and these are the fallback.
-  var WIZ_KEYS = { pctx: 'Ylro7b', pushId: 'qKIAYe', at: 'SNlM0e', bl: 'cfb2h', sid: 'FdrFJe' };
+  // `acct` is the signed-in address, which is not part of any request and is
+  // read for one purpose: saying which account a ledger row belongs to. See
+  // §origins:account.
+  var WIZ_KEYS = {
+    pctx: 'Ylro7b', pushId: 'qKIAYe', at: 'SNlM0e', bl: 'cfb2h', sid: 'FdrFJe',
+    acct: 'oPEP7c'
+  };
 
   // §config ==================================================================
   var VERSION = '3.57.0';
@@ -412,6 +418,25 @@
   var wizCache = null;
   var sniffed = {};
 
+  // Signing a second account in moves every address the application serves
+  // behind a `/u/<n>` segment: the library becomes /u/0/library, a conversation
+  // /u/0/app/<id>. The segment says which account is being served and nothing
+  // about which page, so no check in this script is about it - and each of the
+  // seven that anchored on the bare form answered no on the prefixed one, which
+  // is a mark never drawn and a listing never read rather than an error.
+  //
+  // Read through here rather than at each site, and by the same function for a
+  // stored path as for the current one: a record written while /u/1/app/<id>
+  // was on screen names the conversation /app/<id> names, and the two have to
+  // compare equal or the record is lost to a switch that changed nothing about
+  // the conversation.
+  //
+  // Only that segment, and only when its index is digits: /user/... is a page.
+  function appPath(pathname) {
+    var here = typeof pathname === 'string' ? pathname : location.pathname;
+    return here.replace(/^\/u\/\d+(?=\/|$)/, '') || '/';
+  }
+
   function matchBrace(text, start) {
     var depth = 0;
     var inString = false;
@@ -641,8 +666,15 @@
         // two it was nor that the server said anything about it. The status is
         // the whole of that answer, so it is not thrown away here.
         if (!res.ok) {
+          // With the excerpt, because the status alone says a request was
+          // refused and never which of them: a template replayed against the
+          // wrong account, a body the server would not parse, and an
+          // interstitial all arrive here as the same three digits. Trimmed
+          // rather than whole - these bodies run to pages of markup - and the
+          // length is kept beside it so a truncated one still reads as one.
           throw new Error((rpcId || 'ProcessFile') + ' answered http ' + res.status
-            + ' (' + text.length + ' chars)');
+            + ' (' + text.length + ' chars): '
+            + text.replace(/\s+/g, ' ').slice(0, 160));
         }
         return text;
       });

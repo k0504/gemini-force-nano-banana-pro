@@ -224,7 +224,7 @@
         // record behind for syncOverrides to draw over whichever messages take
         // those ordinals next. The server truncates on the resend, not on the
         // toolbar being drawn.
-        holdSend(indexOfHost(host), location.pathname);
+        holdSend(indexOfHost(host), appPath());
         reportRetryLead(t0);
         pressUpdate(host);
       }

@@ -635,9 +635,9 @@
   // still running would make any single remembered value name the wrong page.
   XMLHttpRequest.prototype.abort = function () {
     if (this.__gpieStreamPath && this.readyState !== 4
-      && location.pathname !== this.__gpieStreamPath) {
+      && appPath() !== this.__gpieStreamPath) {
       dbg('xhr: abort of a StreamGenerate ignored, the page routed from',
-        this.__gpieStreamPath, 'to', location.pathname,
+        this.__gpieStreamPath, 'to', appPath(),
         '- the turn is left to finish on the server');
       return;
     }
@@ -680,7 +680,7 @@
       // Read here, at the send, so the abort hook above compares against the
       // conversation this request was made in and not against wherever the
       // page has got to by the time the abort arrives.
-      this.__gpieStreamPath = location.pathname;
+      this.__gpieStreamPath = appPath();
       // This runs after rewrite() above, so a hold armed by commitSend inside it
       // is claimed by the very request that carries the send.
       traceStream(this, takeWork(), claimInflightSend());

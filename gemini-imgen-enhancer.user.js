@@ -138,7 +138,13 @@
 
   // WIZ_global_data keys the page exposes. They are obfuscated build symbols, so
   // values sniffed off live requests take precedence and these are the fallback.
-  var WIZ_KEYS = { pctx: 'Ylro7b', pushId: 'qKIAYe', at: 'SNlM0e', bl: 'cfb2h', sid: 'FdrFJe' };
+  // `acct` is the signed-in address, which is not part of any request and is
+  // read for one purpose: saying which account a ledger row belongs to. See
+  // §origins:account.
+  var WIZ_KEYS = {
+    pctx: 'Ylro7b', pushId: 'qKIAYe', at: 'SNlM0e', bl: 'cfb2h', sid: 'FdrFJe',
+    acct: 'oPEP7c'
+  };
 
   // §config ==================================================================
   var VERSION = '3.57.0';
@@ -481,6 +487,25 @@
   var wizCache = null;
   var sniffed = {};
 
+  // Signing a second account in moves every address the application serves
+  // behind a `/u/<n>` segment: the library becomes /u/0/library, a conversation
+  // /u/0/app/<id>. The segment says which account is being served and nothing
+  // about which page, so no check in this script is about it - and each of the
+  // seven that anchored on the bare form answered no on the prefixed one, which
+  // is a mark never drawn and a listing never read rather than an error.
+  //
+  // Read through here rather than at each site, and by the same function for a
+  // stored path as for the current one: a record written while /u/1/app/<id>
+  // was on screen names the conversation /app/<id> names, and the two have to
+  // compare equal or the record is lost to a switch that changed nothing about
+  // the conversation.
+  //
+  // Only that segment, and only when its index is digits: /user/... is a page.
+  function appPath(pathname) {
+    var here = typeof pathname === 'string' ? pathname : location.pathname;
+    return here.replace(/^\/u\/\d+(?=\/|$)/, '') || '/';
+  }
+
   function matchBrace(text, start) {
     var depth = 0;
     var inString = false;
@@ -710,8 +735,15 @@
         // two it was nor that the server said anything about it. The status is
         // the whole of that answer, so it is not thrown away here.
         if (!res.ok) {
+          // With the excerpt, because the status alone says a request was
+          // refused and never which of them: a template replayed against the
+          // wrong account, a body the server would not parse, and an
+          // interstitial all arrive here as the same three digits. Trimmed
+          // rather than whole - these bodies run to pages of markup - and the
+          // length is kept beside it so a truncated one still reads as one.
           throw new Error((rpcId || 'ProcessFile') + ' answered http ' + res.status
-            + ' (' + text.length + ' chars)');
+            + ' (' + text.length + ' chars): '
+            + text.replace(/\s+/g, ' ').slice(0, 160));
         }
         return text;
       });
@@ -1406,7 +1438,7 @@
   }
 
   function overrideAt(index) {
-    return overrideAtPath(index, location.pathname);
+    return overrideAtPath(index, appPath());
   }
 
   // One counter for every record this document writes, rather than a count
@@ -1531,7 +1563,7 @@
   // is already in the store and restoreOverrides reads it back on return. The
   // in-flight dbWrite holds its own snapshot and is unaffected.
   function releaseOffPath() {
-    var here = location.pathname;
+    var here = appPath();
     for (var i = overrides.length - 1; i >= 0; i--) {
       var o = overrides[i];
       if (o.path === here) continue;
@@ -1580,13 +1612,20 @@
   function restoreOverrides() {
     releaseOffPath();
     return dbReadAll(RECORDS).then(function (kept) {
-      var mine = kept.filter(function (r) { return r && r.path === location.pathname; });
+      // Both sides read through the account segment. A record written while
+      // /u/1/app/<id> was on screen is a record of this conversation, and
+      // comparing the stored path literally lost it to a switch that changed
+      // nothing about the thread. Rows stored in either form match from here on;
+      // what is held in memory is the read-through form alone, which is what
+      // every comparison after this one uses.
+      var here = appPath();
+      var mine = kept.filter(function (r) { return r && appPath(r.path) === here; });
       if (!mine.length) return;
       mine.forEach(function (r) {
-        if (overrideAtPath(r.index, r.path)) return;
+        if (overrideAtPath(r.index, here)) return;
         var blobs = Array.isArray(r.blobs) ? r.blobs : [];
         overrides.push({
-          path: r.path,
+          path: here,
           index: r.index,
           // Bytes are the only thumb that survives a document. Records written
           // by an earlier version still carry lh3 URLs, and they are dropped
@@ -1622,7 +1661,7 @@
       // in an always-on report - on the ordinary act of clicking another
       // conversation in the sidebar. A report the user learns to ignore is
       // worse than none.
-      if (plan && plan.path === location.pathname && !plan.base
+      if (plan && plan.path === appPath() && !plan.base
         && overrideAtPath(plan.index, plan.path)) {
         if (planIsDirty(plan)) {
           plan.blocked = 'this edit was built before the message\'s record had loaded, so the '
@@ -1819,7 +1858,7 @@
     for (var i = 0; i < overrides.length; i++) {
       var o = overrides[i];
       if (o.view && !o.view.isConnected) o.view = null;
-      if (o.path !== location.pathname) {
+      if (o.path !== appPath()) {
         dropView(o);
         continue;
       }
@@ -2189,7 +2228,7 @@
     // Asked as edit mode opens, so a message that cannot be resent says so
     // while the user is still deciding rather than on the press. See §durable
     // for what puts a record in this state; none of it is repairable from here.
-    var blocked = recordBlocker(index, location.pathname);
+    var blocked = recordBlocker(index, appPath());
     if (blocked) {
       say('error', LOG_IMG, 'message #' + index + ' cannot be resent: ' + blocked);
     }
@@ -2212,7 +2251,7 @@
       // an rpc is asked by conversation id, and the two are not interchangeable.
       // Anything judging this plan after an await needs to know which thread it
       // belongs to rather than which one is on screen by then.
-      path: location.pathname,
+      path: appPath(),
       base: base,
       baseBlobs: baseBlobs,
       blocked: blocked,
@@ -3352,9 +3391,9 @@
   // still running would make any single remembered value name the wrong page.
   XMLHttpRequest.prototype.abort = function () {
     if (this.__gpieStreamPath && this.readyState !== 4
-      && location.pathname !== this.__gpieStreamPath) {
+      && appPath() !== this.__gpieStreamPath) {
       dbg('xhr: abort of a StreamGenerate ignored, the page routed from',
-        this.__gpieStreamPath, 'to', location.pathname,
+        this.__gpieStreamPath, 'to', appPath(),
         '- the turn is left to finish on the server');
       return;
     }
@@ -3397,7 +3436,7 @@
       // Read here, at the send, so the abort hook above compares against the
       // conversation this request was made in and not against wherever the
       // page has got to by the time the abort arrives.
-      this.__gpieStreamPath = location.pathname;
+      this.__gpieStreamPath = appPath();
       // This runs after rewrite() above, so a hold armed by commitSend inside it
       // is claimed by the very request that carries the send.
       traceStream(this, takeWork(), claimInflightSend());
@@ -4261,7 +4300,7 @@
         // record behind for syncOverrides to draw over whichever messages take
         // those ordinals next. The server truncates on the resend, not on the
         // toolbar being drawn.
-        holdSend(indexOfHost(host), location.pathname);
+        holdSend(indexOfHost(host), appPath());
         reportRetryLead(t0);
         pressUpdate(host);
       }
@@ -4649,10 +4688,12 @@
   // only sign a different page is on screen. Read from the scan pass rather
   // than from history: a route change rebuilds the view, so a pass is already
   // on its way, and nothing of the page's own has to be wrapped.
-  var lastPath = location.pathname;
+  // Read through the account segment, so switching account on the same page is
+  // not a route change and a conversation reached by either address is one page.
+  var lastPath = appPath();
   function watchRoute() {
-    if (location.pathname === lastPath) return;
-    lastPath = location.pathname;
+    if (appPath() === lastPath) return;
+    lastPath = appPath();
     // A hold still unclaimed at a route change belongs to a send that never
     // departed - the only way one survives to here is the retry arming by hand
     // and the Update press failing - and it must not be claimed by the next
@@ -4841,14 +4882,28 @@
   // survive the visit to the conversation that produced them.
   var freqCache = Object.create(null);
 
+  // A template is one account's request. There is one store for the browser, so
+  // a template captured while signed in as one account was replayed by the
+  // other and answered http 400 - which arrives as a harvest that read nothing,
+  // an index never built, and no mark on any card of the second account.
+  //
+  // Namespaced rather than shared, and with no reading across: each account
+  // captures its own from its own page's request, which the library page issues
+  // whenever it opens. That is what the wait before the first harvest is for.
+  // See §origins:account for what names the account.
+  function freqKey(store) {
+    return store + ':' + accountHere();
+  }
+
   function storedFreq(store) {
-    if (freqCache[store] !== undefined) return freqCache[store];
+    var key = freqKey(store);
+    if (freqCache[key] !== undefined) return freqCache[key];
     try {
-      freqCache[store] = (typeof GM_getValue === 'function' && GM_getValue(store, '')) || '';
+      freqCache[key] = (typeof GM_getValue === 'function' && GM_getValue(key, '')) || '';
     } catch (e) {
-      freqCache[store] = '';
+      freqCache[key] = '';
     }
-    return freqCache[store];
+    return freqCache[key];
   }
 
   // Which templates this script holds, on the style node. Whether a download
@@ -4863,10 +4918,11 @@
   }
 
   function keepFreq(store, freq) {
-    if (freqCache[store] === freq) return false;
-    freqCache[store] = freq;
+    var key = freqKey(store);
+    if (freqCache[key] === freq) return false;
+    freqCache[key] = freq;
     try {
-      if (typeof GM_setValue === 'function') GM_setValue(store, freq);
+      if (typeof GM_setValue === 'function') GM_setValue(key, freq);
     } catch (e) {
       // A template that cannot be persisted still serves this page.
     }
@@ -5358,7 +5414,7 @@
   // A conversation page names its conversation in its own address, which is the
   // one thing the library page has nothing to read.
   function conversationHere() {
-    var found = /^\/app\/([0-9a-f]{16})/.exec(location.pathname);
+    var found = /^\/app\/([0-9a-f]{16})/.exec(appPath());
     return found ? found[1] : null;
   }
 
@@ -5420,7 +5476,7 @@
   }
 
   function targetOf(button) {
-    if (location.pathname.indexOf('/library') === 0) {
+    if (appPath().indexOf('/library') === 0) {
       var key = previewKeyNear(button);
       return key ? { id: key, key: key } : null;
     }
@@ -5603,7 +5659,7 @@
   }
 
   function markLibraryCards() {
-    if (location.pathname.indexOf('/library') !== 0) return;
+    if (appPath().indexOf('/library') !== 0) return;
     var imgs = document.querySelectorAll(
       'div.library-item-card > img[src*="googleusercontent.com/gg/"]');
     for (var i = 0; i < imgs.length; i++) {
@@ -5632,7 +5688,7 @@
   // Without this the mark existed only where images are listed and not where
   // they are made, which reads as the mark being broken.
   function markConversationImages() {
-    if (location.pathname.indexOf('/app/') !== 0) return;
+    if (appPath().indexOf('/app/') !== 0) return;
     var hosts = document.querySelectorAll('single-image[data-image-attachment-index]');
     for (var i = 0; i < hosts.length; i++) {
       var host = hosts[i];
@@ -5717,6 +5773,43 @@
 
   function turnSlot(resp, slot) {
     return resp + '#' + slot;
+  }
+
+  // §origins:account ---------------------------------------------------------
+  // The ledger is one store for gemini.google.com, and a second signed-in
+  // account shares it: the taps read what the requests carry and no request
+  // says which account made it, so both accounts' tokens land in the same
+  // place. That is harmless to a lookup - a turn is only ever reached through
+  // the listing of the account that owns it - and fatal to the prune, which
+  // deletes every row the listing it just read does not name. Read as one
+  // library, the other account's images are images that have been deleted.
+  //
+  // So each row says whose it is, and the prune judges only its own.
+  //
+  // Two answers, and which one is in hand is part of the answer. The address is
+  // the account's position in the switcher, which moves when an account is
+  // signed out; the page's own datum is the account itself and does not. The
+  // datum sits behind an obfuscated build symbol that can be renamed under us,
+  // so the address is the fallback rather than the source - and a row written
+  // under one is never compared against a row written under the other, which
+  // costs a rename nothing more than a prune that stops retiring old rows.
+  //
+  // Folded rather than stored: the ledger is readable by anything on this
+  // origin, and which images are whose is all this has to answer.
+  function accountHere() {
+    var mail = wiz(WIZ_KEYS.acct);
+    if (typeof mail === 'string' && mail.indexOf('@') !== -1) {
+      var fold = 5381;
+      for (var i = 0; i < mail.length; i++) {
+        fold = ((fold * 33) ^ mail.charCodeAt(i)) >>> 0;
+      }
+      return 'e:' + fold.toString(16);
+    }
+    // Measured against two accounts on one browser: /library and /u/0/library
+    // are served the same account, so the bare address is the first one and not
+    // a third state.
+    var numbered = /^\/u\/(\d+)(?=\/|$)/.exec(location.pathname);
+    return 'u:' + (numbered ? numbered[1] : '0');
   }
 
   // The ledger's size as an attribute, which survives where a log line does
@@ -6066,12 +6159,16 @@
       dbg('origins: the tokens could not be read (' + err.message + ')');
       return;
     }
+    var here = accountHere();
     var fresh = [];
     rows.forEach(function (row) {
       var at = turnSlot(row.resp, row.slot);
       if (turnTokens[at] && turnTokens[at].token === row.token) return;
       row.key = 'tok:' + at;
       row.conv = conv;
+      // Whose turn this is, written at the only moment it is known: the answer
+      // being read was served to whoever is signed in now. See §origins:account.
+      row.acct = here;
       holdToken(row);
       fresh.push(row);
     });
@@ -6160,11 +6257,51 @@
   // Only against a listing read to its end. A harvest that stopped early has
   // seen some of the library, and pruning against that would throw away tokens
   // for cards it simply never reached.
+  // Every row this script already holds was written before the account was
+  // recorded, and none of them is ever rewritten: rememberTokens skips a token
+  // already held, so nothing on the reading side would ever stamp one and the
+  // prune below - which judges only rows it can place - would be inert for good
+  // on exactly the ledger it exists to keep.
+  //
+  // The listing places them. A turn it names is a turn this account owns, which
+  // is the same fact the prune reads in the negative, so adopting on it costs no
+  // request and no new assumption. Only the turns it names: a row it is silent
+  // about is a row this listing cannot speak for, and taking those would hand
+  // the other account's ledger to whichever library happened to be read first.
+  //
+  // Written back rather than held, or the next document reads them unplaced and
+  // the adoption has to happen again on every load.
+  function adoptListed(standing) {
+    var here = accountHere();
+    var taken = [];
+    for (var at in turnTokens) {
+      var row = turnTokens[at];
+      if (row.acct || !standing[row.resp]) continue;
+      row.acct = here;
+      taken.push(row);
+    }
+    if (!taken.length) return 0;
+    dbWrite(ORIGINS, taken).then(function () {
+      dbg('origins:', taken.length, 'tokens placed with the account that listed them');
+    }).catch(function (err) {
+      say('warn', LOG_IMG, 'the tokens could not be placed with their account:', err);
+    });
+    return taken.length;
+  }
+
+  // Only ever against the account whose listing was read. A row belonging to
+  // another account is absent from this listing because this listing could not
+  // have named it, and a row from before the account was recorded cannot be
+  // placed at all - neither is evidence of a deleted card, and the deletion is
+  // permanent where the evidence is not. Both are left for a listing read while
+  // signed in as their owner, which is the only reading that can retire them.
   function pruneVanished(standing) {
+    var here = accountHere();
     var gone = [];
     for (var at in turnTokens) {
       var row = turnTokens[at];
       if (standing[row.resp]) continue;
+      if (row.acct !== here) continue;
       gone.push(row);
     }
     if (!gone.length) return 0;
@@ -6337,9 +6474,13 @@
       // a harvest that stopped early and one that found nothing read the same
       // to anyone who was not watching the console while it ran.
       var named = Object.keys(knownConvs).length - known;
+      // Both read the same listing, and both only from one read to its end: a
+      // harvest that stopped early has seen some of the library, and neither
+      // what it names nor what it omits speaks for the pages it never reached.
+      var placed = why === 'read to the end' ? adoptListed(standing) : 0;
       var dropped = why === 'read to the end' ? pruneVanished(standing) : 0;
       var told = pages + ' pages, ' + cards + ' cards, ' + indexed + ' indexed, '
-        + named + ' named, ' + dropped + ' dropped, ' + why;
+        + named + ' named, ' + placed + ' placed, ' + dropped + ' dropped, ' + why;
       var node = document.getElementById('gpie-style');
       if (node) node.setAttribute('data-harvest', told);
       info('origins: ' + told);
@@ -6379,7 +6520,7 @@
   var indexedAt = 0;
 
   function indexLibrary() {
-    if (location.pathname.indexOf('/library') !== 0) return;
+    if (appPath().indexOf('/library') !== 0) return;
     // `harvested` no longer serves as this guard, since it now says a harvest
     // has happened at some point rather than that one is under way.
     if (harvesting) return;
@@ -6410,7 +6551,7 @@
     }
     // The library is the one page that can say which conversations matter, so
     // it is read first and the sweep follows on what it found.
-    if (location.pathname.indexOf('/library') === 0 && !harvested) {
+    if (appPath().indexOf('/library') === 0 && !harvested) {
       harvested = true;
       indexedAt = Date.now();
       // The harvest is an optimisation, not a precondition: the ids it looks

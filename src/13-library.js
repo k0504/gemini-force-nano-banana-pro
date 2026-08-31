@@ -44,14 +44,28 @@
   // survive the visit to the conversation that produced them.
   var freqCache = Object.create(null);
 
+  // A template is one account's request. There is one store for the browser, so
+  // a template captured while signed in as one account was replayed by the
+  // other and answered http 400 - which arrives as a harvest that read nothing,
+  // an index never built, and no mark on any card of the second account.
+  //
+  // Namespaced rather than shared, and with no reading across: each account
+  // captures its own from its own page's request, which the library page issues
+  // whenever it opens. That is what the wait before the first harvest is for.
+  // See §origins:account for what names the account.
+  function freqKey(store) {
+    return store + ':' + accountHere();
+  }
+
   function storedFreq(store) {
-    if (freqCache[store] !== undefined) return freqCache[store];
+    var key = freqKey(store);
+    if (freqCache[key] !== undefined) return freqCache[key];
     try {
-      freqCache[store] = (typeof GM_getValue === 'function' && GM_getValue(store, '')) || '';
+      freqCache[key] = (typeof GM_getValue === 'function' && GM_getValue(key, '')) || '';
     } catch (e) {
-      freqCache[store] = '';
+      freqCache[key] = '';
     }
-    return freqCache[store];
+    return freqCache[key];
   }
 
   // Which templates this script holds, on the style node. Whether a download
@@ -66,10 +80,11 @@
   }
 
   function keepFreq(store, freq) {
-    if (freqCache[store] === freq) return false;
-    freqCache[store] = freq;
+    var key = freqKey(store);
+    if (freqCache[key] === freq) return false;
+    freqCache[key] = freq;
     try {
-      if (typeof GM_setValue === 'function') GM_setValue(store, freq);
+      if (typeof GM_setValue === 'function') GM_setValue(key, freq);
     } catch (e) {
       // A template that cannot be persisted still serves this page.
     }
@@ -561,7 +576,7 @@
   // A conversation page names its conversation in its own address, which is the
   // one thing the library page has nothing to read.
   function conversationHere() {
-    var found = /^\/app\/([0-9a-f]{16})/.exec(location.pathname);
+    var found = /^\/app\/([0-9a-f]{16})/.exec(appPath());
     return found ? found[1] : null;
   }
 
@@ -623,7 +638,7 @@
   }
 
   function targetOf(button) {
-    if (location.pathname.indexOf('/library') === 0) {
+    if (appPath().indexOf('/library') === 0) {
       var key = previewKeyNear(button);
       return key ? { id: key, key: key } : null;
     }
@@ -806,7 +821,7 @@
   }
 
   function markLibraryCards() {
-    if (location.pathname.indexOf('/library') !== 0) return;
+    if (appPath().indexOf('/library') !== 0) return;
     var imgs = document.querySelectorAll(
       'div.library-item-card > img[src*="googleusercontent.com/gg/"]');
     for (var i = 0; i < imgs.length; i++) {
@@ -835,7 +850,7 @@
   // Without this the mark existed only where images are listed and not where
   // they are made, which reads as the mark being broken.
   function markConversationImages() {
-    if (location.pathname.indexOf('/app/') !== 0) return;
+    if (appPath().indexOf('/app/') !== 0) return;
     var hosts = document.querySelectorAll('single-image[data-image-attachment-index]');
     for (var i = 0; i < hosts.length; i++) {
       var host = hosts[i];
