@@ -3,44 +3,21 @@
   // exists an older generation cannot be re-rolled from the page. The retry
   // here is the editor's own resend with nothing changed: the message goes out
   // again as it stands and the server's own resend semantics apply - the new
-  // answer replaces the old one and the turns after it are discarded. The
-  // button is armed by a first press and fires on the second, because a stray
-  // click must not be what discards half a conversation.
+  // answer replaces the old one and the turns after it are discarded.
+  //
+  // One press, one resend. This button was armed by a first press and fired on
+  // the second, on the reasoning that a stray click must not discard half a
+  // conversation - but the same is true of the page's own regenerate, which
+  // takes one press, and a control that does nothing the first time is a
+  // control that reads as broken. The title says what the press does; that is
+  // where a warning belongs.
   var RETRY_STEP_MS = 4000;
   var RETRY_UPLOAD_MS = 30000;
   var RETRY_POLL_MS = 60;
   var retryPending = false;
 
-  // The arming window. One button at a time holds it, and it lapses on its own
-  // so a press left behind cannot be completed by a click made minutes later
-  // with something else on screen.
-  var RETRY_ARM_MS = 6000;
   var RETRY_TITLE = 'Resend this message as it stands and regenerate its answer. '
     + 'The turns after it are replaced, as with an edit.';
-  var RETRY_ARMED_TITLE = 'Click again to resend. The turns after this message are discarded.';
-  var armed = null;
-  var armedTimer = 0;
-
-  function disarm() {
-    if (armedTimer) { clearTimeout(armedTimer); armedTimer = 0; }
-    if (!armed) return;
-    armed.classList.remove('gpie-armed');
-    armed.title = RETRY_TITLE;
-    armed = null;
-  }
-
-  function arm(btn) {
-    disarm();
-    armed = btn;
-    btn.classList.add('gpie-armed');
-    btn.title = RETRY_ARMED_TITLE;
-    info(LOG_IMG, 'retry: armed, click again within ' + (RETRY_ARM_MS / 1000) + 's to resend');
-    armedTimer = setTimeout(function () {
-      armedTimer = 0;
-      info(LOG_IMG, 'retry: the arming lapsed, nothing was sent');
-      disarm();
-    }, RETRY_ARM_MS);
-  }
 
   function waitUntil(check, timeout, then) {
     var deadline = performance.now() + timeout;
@@ -255,23 +232,13 @@
         // Either way the retry would open edit mode on a message already open
         // for editing, which throws the edit being made away.
         if (document.querySelector('div.user-query-container.edit-mode')) {
-          disarm();
           say('warn', LOG_IMG, 'retry: refused - a message is open for editing');
           return;
         }
         var turn = wrap.closest('.conversation-container');
         var host = turn && turn.querySelector('div.user-query-container');
         if (!host) return;
-        // Armed by the first press, fired by the second. What this button does
-        // is discard every turn after the message, so a stray click - and the
-        // clone sits where the page's own controls are - must not be what
-        // spends half a conversation.
-        if (armed === btn) {
-          disarm();
-          startRetry(host);
-          return;
-        }
-        arm(btn);
+        startRetry(host);
       });
     }
     return wrap;
@@ -300,12 +267,6 @@
 
   function removeRetryButtons() {
     var stale = document.querySelectorAll('.gpie-retry');
-    // The armed button is one of these when the page rebuilds the row, and a
-    // reference to a node no longer in the tree cannot be disarmed by a click.
-    if (armed && !document.contains(armed)) disarm();
-    for (var i = 0; i < stale.length; i++) {
-      if (armed && stale[i].contains(armed)) disarm();
-      stale[i].remove();
-    }
+    for (var i = 0; i < stale.length; i++) stale[i].remove();
   }
 

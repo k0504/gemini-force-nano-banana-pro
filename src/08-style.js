@@ -23,10 +23,6 @@
     // The sweep runs for half a minute against a page that shows nothing while
     // it does, and the menu command that starts it read as doing nothing at
     // all. This is where it says otherwise.
-    // The armed retry reads as a warning until it is pressed again or the
-    // window lapses; nothing else on the row changes colour.
-    '.gpie-retry .gpie-armed,.gpie-retry button.gpie-armed{outline:2px solid #e5a50a;',
-    'outline-offset:2px;border-radius:50%}',
     '.gpie-progress{position:fixed;right:16px;bottom:16px;z-index:2147483000;',
     'max-width:320px;padding:9px 13px;border-radius:10px;',
     'background:rgba(32,33,36,.94);color:#e8eaed;border:1px solid rgba(255,255,255,.14);',
