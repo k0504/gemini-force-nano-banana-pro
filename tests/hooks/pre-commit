@@ -1,0 +1,8 @@
+#!/bin/sh
+# Enable with: git config core.hooksPath tests/hooks
+#
+# This exists because the defects this repository keeps repeating are
+# regressions, not new mistakes: a shape that was measured, written, and then
+# undone by a later change that had no way of knowing. Prose in AGENTS.md does
+# not fail when it stops being true. These do.
+exec "$(dirname "$0")/../run-all.sh"
