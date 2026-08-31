@@ -19,6 +19,22 @@
   var RETRY_TITLE = 'Resend this message as it stands and regenerate its answer. '
     + 'The turns after it are replaced, as with an edit.';
 
+  // Which message the next plan is being built for a retry of. Declared to
+  // makePlan rather than set on the plan afterwards, and that ordering is the
+  // whole point: a plan decides at creation whether to re-upload every existing
+  // attachment, and a retry sends none of them.
+  //
+  // Set before edit mode is opened, because the scan pass that builds the plan
+  // can run in the same frame as the click. Read once and cleared, so a plan
+  // built for anything else afterwards is not mistaken for this one.
+  var retryIntent = null;
+
+  function claimRetryIntent(host) {
+    if (retryIntent !== host) return false;
+    retryIntent = null;
+    return true;
+  }
+
   function waitUntil(check, timeout, then) {
     var deadline = performance.now() + timeout;
     (function poll() {
@@ -134,6 +150,11 @@
     retryPending = true;
     var t0 = performance.now();
     dbg('retry: opening edit mode on message #' + indexOfHost(host));
+    // Ahead of the click, because the scan pass that builds the plan can run in
+    // the same frame as it, and the plan has to know at creation that it is a
+    // retry. Declaring it afterwards left every retry waiting on a full
+    // re-upload of images it was never going to send.
+    retryIntent = host;
     editBtn.click();
     waitUntil(function () {
       if (!host.classList.contains('edit-mode')) return null;
@@ -151,43 +172,49 @@
     }, RETRY_STEP_MS, function (got) {
       if (!got) {
         retryPending = false;
+        retryIntent = null;
         say('warn', LOG_IMG, 'retry: edit mode did not open, or its plan never armed');
         return;
       }
       dbg('retry: edit mode open, plan =', got.p ? '#' + got.p.index : 'none');
       if (got.p) {
-        got.p.retry = true;
         // Straight to renderBar rather than a scan pass, because ensureBar
         // returns early while the toolbar is connected and the sentinel that
         // unlocks Update is applied by renderBar's syncSentinel, nowhere else.
         renderBar(got.p);
-        if (retryNeedsFresh(got.p)) {
-          got.p.retryFresh = true;
-          info('retry: the record holds references this document cannot send, '
-            + 're-uploading before the retry');
-          freshenExisting(got.p);
-          waitUntil(function () {
-            return planIsReady(got.p) || null;
-          }, RETRY_UPLOAD_MS, function (ready) {
-            if (!ready) {
-              // The deadline expiring is not the whole story: the send goes out
-              // regardless, and what it goes out as is what the user waits for.
-              say('warn', LOG_IMG, 'retry: re-upload unfinished, sending what is held'
-                + ', the send cannot take the fast shape and may carry references '
-                + 'the server no longer honours');
-            }
-            reportRetryLead(t0);
-            pressUpdate(host);
-          });
-        } else {
-          // Nothing to wait for: the references the message carries are ones
-          // this document can send as they stand.
+        // Whether anything had to be re-uploaded was decided in makePlan, off
+        // the same retryNeedsFresh this file owns. The ordinary retry has
+        // nothing in flight and presses now; the exception is the record whose
+        // references this document cannot send, which has no other way to go
+        // out at all.
+        if (!got.p.retryFresh) {
           reportRetryLead(t0);
           pressUpdate(host);
+          return;
         }
+        info('retry: the record holds references this document cannot send, '
+          + 're-uploading before the retry');
+        waitUntil(function () {
+          return planIsReady(got.p) || null;
+        }, RETRY_UPLOAD_MS, function (ready) {
+          if (!ready) {
+            // Not a slower send: with the record's references unusable and the
+            // re-upload unfinished, there is no list to write, so §resend
+            // refuses the press rather than sending one.
+            retryPending = false;
+            say('warn', LOG_IMG, 'retry: the re-upload did not finish, so there is nothing '
+              + 'this document can send; press Update again when it has, or cancel');
+            return;
+          }
+          reportRetryLead(t0);
+          pressUpdate(host);
+        });
       } else {
         // No plan to report dirty through, so the sentinel is written by hand;
-        // rewrite() strips it with or without a plan.
+        // rewrite() strips it with or without a plan. The declared intent goes
+        // with it: no plan was built to claim it, and one built for this host
+        // later would be an ordinary edit reading a retry's intent as its own.
+        retryIntent = null;
         writeTextarea(got.textarea, got.textarea.value + SENTINEL);
         // And the hold by hand with it. Whether the records this resend
         // discards are dealt with was answered by "does a plan exist", which

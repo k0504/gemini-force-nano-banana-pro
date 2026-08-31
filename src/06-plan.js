@@ -52,6 +52,15 @@
       base: base,
       baseBlobs: baseBlobs,
       blocked: blocked,
+      // Declared by §retry before it opened edit mode, not set on the plan
+      // afterwards. A retry changes no image and writes the record's own
+      // references - measured at 6.3s against 78.2s for the converted shape -
+      // so the re-uploads below are not what it sends, and a plan that learns
+      // it is a retry only after they have started spends the user's press
+      // waiting for bytes nothing will read. That wait is what made the button
+      // feel like it opens an editor rather than resending.
+      retry: false,
+      retryFresh: false,
       originalCount: thumbs.length,
       originalThumbs: thumbs.slice(),
       entries: entries,
@@ -72,7 +81,17 @@
     // nine-element shape the timing table measures at 79.9s against 24.2s. The
     // regression therefore arrived on its own, one record upgrade after the
     // shape work landed, which is what made it read as the fix coming undone.
-    freshenExisting(p);
+    p.retry = claimRetryIntent(host);
+    // The exception, and the only one: a record whose references this document
+    // cannot send has nothing to write the retry from either, so those are
+    // re-uploaded and the retry waits for them. §retry owns that judgement.
+    p.retryFresh = p.retry && retryNeedsFresh(p);
+    if (p.retry && !p.retryFresh) {
+      dbg('makePlan: message #' + index + ' is a retry of what the record already holds, '
+        + 'no attachment is re-uploaded');
+    } else {
+      freshenExisting(p);
+    }
     return p;
   }
 
@@ -102,6 +121,11 @@
     // A record that cannot be trusted is not made ready by finishing the
     // uploads: what the list would be written from is the thing in doubt.
     if (p.blocked) return false;
+    // A retry sends the record's references as they stand and no upload of
+    // this plan's, so there is nothing here for it to be waiting on. This
+    // gates the sentinel that unlocks Update, which is why waiting here was
+    // the whole of the delay between the press and the resend.
+    if (p.retry && !p.retryFresh) return true;
     return p.entries.every(function (entry) {
       return entry.kind === 'existing' ? entry.freshAttachment : entry.attachment;
     });
@@ -395,6 +419,25 @@
     dbg('applyPlanTo: plan wants', p.entries.map(function (e) {
       return e.kind === 'existing' ? 'existing#' + e.index : 'new:' + e.name;
     }).join(', '));
+
+    // A retry changes no image, so the list it writes is the one the message
+    // already holds - the same list nativeRetryContribution writes for the
+    // page's own control, and for the same reason: the server holds these
+    // references already, and re-uploading them to send a converted shape was
+    // measured at 78.2s against 6.3s. Nothing was uploaded for this plan, so
+    // the entries carry no fresh attachment and the checks below, which read
+    // them, do not describe this path.
+    if (p.retry && !p.retryFresh) {
+      if (!Array.isArray(base) || base.length !== p.originalCount) {
+        refuseSend('the retry of message #' + p.index + ' has ' + (Array.isArray(base)
+          ? base.length + ' attachments' : 'no attachment list')
+          + ' to send against the ' + p.originalCount + ' the message shows');
+        return false;
+      }
+      tuple[ATTACHMENTS] = base.slice();
+      dbg('applyPlanTo: retry, wrote the list the message already holds |', attShape(base));
+      return true;
+    }
 
     // What the list will be written from has to exist first. The count below
     // compares the base against the plan's original length, which says nothing

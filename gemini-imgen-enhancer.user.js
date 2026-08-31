@@ -6,7 +6,7 @@
 // @license      MIT
 // @homepageURL  https://github.com/k0504/gemini-imgen-enhancer
 // @supportURL   https://github.com/k0504/gemini-imgen-enhancer/issues
-// @version      3.56.0
+// @version      3.57.0
 // @description  Force Gemini image generation onto Nano Banana Pro from the first request, and edit the images attached to an existing prompt.
 // @description:zh-TW  自首次請求即強制以 Nano Banana Pro 生成圖片，並可編輯既有 prompt 附加的圖片。
 // @match        https://gemini.google.com/*
@@ -141,7 +141,7 @@
   var WIZ_KEYS = { pctx: 'Ylro7b', pushId: 'qKIAYe', at: 'SNlM0e', bl: 'cfb2h', sid: 'FdrFJe' };
 
   // §config ==================================================================
-  var VERSION = '3.56.0';
+  var VERSION = '3.57.0';
 
   // Gemini keeps its own Update button disabled until the prompt text differs
   // from what the message already holds, so an image-only change cannot be
@@ -2216,6 +2216,15 @@
       base: base,
       baseBlobs: baseBlobs,
       blocked: blocked,
+      // Declared by §retry before it opened edit mode, not set on the plan
+      // afterwards. A retry changes no image and writes the record's own
+      // references - measured at 6.3s against 78.2s for the converted shape -
+      // so the re-uploads below are not what it sends, and a plan that learns
+      // it is a retry only after they have started spends the user's press
+      // waiting for bytes nothing will read. That wait is what made the button
+      // feel like it opens an editor rather than resending.
+      retry: false,
+      retryFresh: false,
       originalCount: thumbs.length,
       originalThumbs: thumbs.slice(),
       entries: entries,
@@ -2236,7 +2245,17 @@
     // nine-element shape the timing table measures at 79.9s against 24.2s. The
     // regression therefore arrived on its own, one record upgrade after the
     // shape work landed, which is what made it read as the fix coming undone.
-    freshenExisting(p);
+    p.retry = claimRetryIntent(host);
+    // The exception, and the only one: a record whose references this document
+    // cannot send has nothing to write the retry from either, so those are
+    // re-uploaded and the retry waits for them. §retry owns that judgement.
+    p.retryFresh = p.retry && retryNeedsFresh(p);
+    if (p.retry && !p.retryFresh) {
+      dbg('makePlan: message #' + index + ' is a retry of what the record already holds, '
+        + 'no attachment is re-uploaded');
+    } else {
+      freshenExisting(p);
+    }
     return p;
   }
 
@@ -2266,6 +2285,11 @@
     // A record that cannot be trusted is not made ready by finishing the
     // uploads: what the list would be written from is the thing in doubt.
     if (p.blocked) return false;
+    // A retry sends the record's references as they stand and no upload of
+    // this plan's, so there is nothing here for it to be waiting on. This
+    // gates the sentinel that unlocks Update, which is why waiting here was
+    // the whole of the delay between the press and the resend.
+    if (p.retry && !p.retryFresh) return true;
     return p.entries.every(function (entry) {
       return entry.kind === 'existing' ? entry.freshAttachment : entry.attachment;
     });
@@ -2559,6 +2583,25 @@
     dbg('applyPlanTo: plan wants', p.entries.map(function (e) {
       return e.kind === 'existing' ? 'existing#' + e.index : 'new:' + e.name;
     }).join(', '));
+
+    // A retry changes no image, so the list it writes is the one the message
+    // already holds - the same list nativeRetryContribution writes for the
+    // page's own control, and for the same reason: the server holds these
+    // references already, and re-uploading them to send a converted shape was
+    // measured at 78.2s against 6.3s. Nothing was uploaded for this plan, so
+    // the entries carry no fresh attachment and the checks below, which read
+    // them, do not describe this path.
+    if (p.retry && !p.retryFresh) {
+      if (!Array.isArray(base) || base.length !== p.originalCount) {
+        refuseSend('the retry of message #' + p.index + ' has ' + (Array.isArray(base)
+          ? base.length + ' attachments' : 'no attachment list')
+          + ' to send against the ' + p.originalCount + ' the message shows');
+        return false;
+      }
+      tuple[ATTACHMENTS] = base.slice();
+      dbg('applyPlanTo: retry, wrote the list the message already holds |', attShape(base));
+      return true;
+    }
 
     // What the list will be written from has to exist first. The count below
     // compares the base against the plan's original length, which says nothing
@@ -4013,6 +4056,22 @@
   var RETRY_TITLE = 'Resend this message as it stands and regenerate its answer. '
     + 'The turns after it are replaced, as with an edit.';
 
+  // Which message the next plan is being built for a retry of. Declared to
+  // makePlan rather than set on the plan afterwards, and that ordering is the
+  // whole point: a plan decides at creation whether to re-upload every existing
+  // attachment, and a retry sends none of them.
+  //
+  // Set before edit mode is opened, because the scan pass that builds the plan
+  // can run in the same frame as the click. Read once and cleared, so a plan
+  // built for anything else afterwards is not mistaken for this one.
+  var retryIntent = null;
+
+  function claimRetryIntent(host) {
+    if (retryIntent !== host) return false;
+    retryIntent = null;
+    return true;
+  }
+
   function waitUntil(check, timeout, then) {
     var deadline = performance.now() + timeout;
     (function poll() {
@@ -4128,6 +4187,11 @@
     retryPending = true;
     var t0 = performance.now();
     dbg('retry: opening edit mode on message #' + indexOfHost(host));
+    // Ahead of the click, because the scan pass that builds the plan can run in
+    // the same frame as it, and the plan has to know at creation that it is a
+    // retry. Declaring it afterwards left every retry waiting on a full
+    // re-upload of images it was never going to send.
+    retryIntent = host;
     editBtn.click();
     waitUntil(function () {
       if (!host.classList.contains('edit-mode')) return null;
@@ -4145,43 +4209,49 @@
     }, RETRY_STEP_MS, function (got) {
       if (!got) {
         retryPending = false;
+        retryIntent = null;
         say('warn', LOG_IMG, 'retry: edit mode did not open, or its plan never armed');
         return;
       }
       dbg('retry: edit mode open, plan =', got.p ? '#' + got.p.index : 'none');
       if (got.p) {
-        got.p.retry = true;
         // Straight to renderBar rather than a scan pass, because ensureBar
         // returns early while the toolbar is connected and the sentinel that
         // unlocks Update is applied by renderBar's syncSentinel, nowhere else.
         renderBar(got.p);
-        if (retryNeedsFresh(got.p)) {
-          got.p.retryFresh = true;
-          info('retry: the record holds references this document cannot send, '
-            + 're-uploading before the retry');
-          freshenExisting(got.p);
-          waitUntil(function () {
-            return planIsReady(got.p) || null;
-          }, RETRY_UPLOAD_MS, function (ready) {
-            if (!ready) {
-              // The deadline expiring is not the whole story: the send goes out
-              // regardless, and what it goes out as is what the user waits for.
-              say('warn', LOG_IMG, 'retry: re-upload unfinished, sending what is held'
-                + ', the send cannot take the fast shape and may carry references '
-                + 'the server no longer honours');
-            }
-            reportRetryLead(t0);
-            pressUpdate(host);
-          });
-        } else {
-          // Nothing to wait for: the references the message carries are ones
-          // this document can send as they stand.
+        // Whether anything had to be re-uploaded was decided in makePlan, off
+        // the same retryNeedsFresh this file owns. The ordinary retry has
+        // nothing in flight and presses now; the exception is the record whose
+        // references this document cannot send, which has no other way to go
+        // out at all.
+        if (!got.p.retryFresh) {
           reportRetryLead(t0);
           pressUpdate(host);
+          return;
         }
+        info('retry: the record holds references this document cannot send, '
+          + 're-uploading before the retry');
+        waitUntil(function () {
+          return planIsReady(got.p) || null;
+        }, RETRY_UPLOAD_MS, function (ready) {
+          if (!ready) {
+            // Not a slower send: with the record's references unusable and the
+            // re-upload unfinished, there is no list to write, so §resend
+            // refuses the press rather than sending one.
+            retryPending = false;
+            say('warn', LOG_IMG, 'retry: the re-upload did not finish, so there is nothing '
+              + 'this document can send; press Update again when it has, or cancel');
+            return;
+          }
+          reportRetryLead(t0);
+          pressUpdate(host);
+        });
       } else {
         // No plan to report dirty through, so the sentinel is written by hand;
-        // rewrite() strips it with or without a plan.
+        // rewrite() strips it with or without a plan. The declared intent goes
+        // with it: no plan was built to claim it, and one built for this host
+        // later would be an ordinary edit reading a retry's intent as its own.
+        retryIntent = null;
         writeTextarea(got.textarea, got.textarea.value + SENTINEL);
         // And the hold by hand with it. Whether the records this resend
         // discards are dealt with was answered by "does a plan exist", which
