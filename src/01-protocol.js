@@ -78,7 +78,7 @@
   };
 
   // §config ==================================================================
-  var VERSION = '3.58.0';
+  var VERSION = '3.59.0';
 
   // Gemini keeps its own Update button disabled until the prompt text differs
   // from what the message already holds, so an image-only change cannot be
@@ -116,6 +116,19 @@
   //           what the send cost. That is the number §shape is measured
   //           against, so it is never behind the flag.
   var DBG_STORE = 'gpieDbgLog';
+  // The same lines again, in localStorage, and never replayed. The per-tab
+  // buffer above is gone the moment the tab is closed, which is the tab an
+  // intermittent failure was traced in: by the time the failure is looked at,
+  // the only account of the send that caused it has been closed with it. This
+  // one is written for reading afterwards and nothing else, so it holds far
+  // more than a replay would be worth printing.
+  //
+  // Nothing clears it but its own cap. Turning the trace off drops the per-tab
+  // buffer, because that one is replayed and a replay of a trace nobody asked
+  // for is noise; dropping this one would destroy the account of the failure
+  // that the trace was turned off after, which is the thing it exists to keep.
+  var DBG_KEEP = 'gpieDbgKeep';
+  var DBG_KEEP_CHARS = 400000;
   var STORE_DBG = 'gpieDebugTrace';
   var debugTrace = typeof GM_getValue === 'function'
     ? GM_getValue(STORE_DBG, false) : false;
@@ -145,6 +158,20 @@
     }
   }
 
+  // A string rather than a JSON array, because this is appended to on every
+  // traced line and a send traces dozens: parsing and re-serialising thousands
+  // of entries per line would cost more than the trace is worth. Trimming cuts
+  // at a newline so the oldest line to survive is a whole one. A single line
+  // longer than the cap is kept whole and alone - it is the newest, which is
+  // the one being written for.
+  function dbgKeep(prev, line, cap) {
+    var next = (prev || '') + line + '\n';
+    if (next.length <= cap) return next;
+    var cut = next.indexOf('\n', next.length - cap);
+    if (cut === -1 || cut === next.length - 1) return line + '\n';
+    return next.slice(cut + 1);
+  }
+
   function dbg() {
     if (!debugTrace) return;
     var line = Array.prototype.map.call(arguments, function (a) {
@@ -159,6 +186,13 @@
       sessionStorage.setItem(DBG_STORE, JSON.stringify(kept));
     } catch (e) {
       // Storage full or unavailable; the live console line already went out.
+    }
+    try {
+      localStorage.setItem(DBG_KEEP,
+        dbgKeep(localStorage.getItem(DBG_KEEP), stamp + ' ' + line, DBG_KEEP_CHARS));
+    } catch (e) {
+      // As above. This buffer is a convenience for reading a failure back
+      // afterwards, and losing it costs nothing that is happening now.
     }
   }
 

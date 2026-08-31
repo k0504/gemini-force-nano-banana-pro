@@ -1005,6 +1005,128 @@
     return bar;
   }
 
+  // How long the record may describe more images than the page shows before the
+  // disagreement is treated as real. Angular rebuilds a carousel in pieces, and
+  // a pass that lands mid-rebuild sees a message that is momentarily short.
+  var SHORTFALL_GRACE_MS = 3000;
+
+  // A pass is what samples the shortfall, and passes are raised by mutations of
+  // a tree that has finished changing: the second sample the verdict below
+  // needs to reach its decision never arrives on its own. This is what asks for
+  // it. One outstanding timer is enough - it re-samples every record - and a
+  // pass that finds the shortfall still standing arms nothing, because by then
+  // the verdict is no longer 'wait'.
+  var shortfallTimer = null;
+
+  function armShortfallRecheck() {
+    if (shortfallTimer) return;
+    shortfallTimer = setTimeout(function () {
+      shortfallTimer = null;
+      schedule();
+    }, SHORTFALL_GRACE_MS + 250);
+  }
+
+  // Which of the two opposite states a short page is in.
+  //
+  // Immediately after a resend the carousel still holds the list from before
+  // the send while the record and the server hold the new one: the record is
+  // right and the page is behind, and rewriting the record from the page would
+  // replace the list that was just sent with the one it replaced. After a
+  // reload the carousel is what the server returned, so a record still holding
+  // more is describing an image the conversation does not have - and that entry
+  // has no thumbnail, no bytes and no source to upload from, so every later
+  // edit of that message is refused by planIsReady with the Update button
+  // locked and nothing said.
+  //
+  // The first state cannot outlast a render; the second never resolves. So the
+  // clock is what separates them, and it starts over the moment the two agree.
+  function shortfallVerdict(o, pageCount, now) {
+    if (!o || !Array.isArray(o.thumbs)) return 'ok';
+    if (pageCount >= o.thumbs.length) {
+      o.shortAt = null;
+      return 'ok';
+    }
+    if (o.reconciled) return 'held';
+    if (!o.shortAt) {
+      o.shortAt = now;
+      return 'wait';
+    }
+    return now - o.shortAt >= SHORTFALL_GRACE_MS ? 'reconcile' : 'wait';
+  }
+
+  // Rebuilding the record from what the conversation actually holds. Reached
+  // only from the verdict above, so the page being read from here is one the
+  // server rendered rather than one waiting on a rebuild.
+  //
+  // The anchor is the thumbnail URL of each image the page is showing, not the
+  // multiset of file names the record sent. Names are what refreshOverride
+  // matches on, and a record that disagrees with the server is exactly the case
+  // where that match is unsafe: the names being looked for include one the
+  // conversation does not have.
+  //
+  // Once only, whether it succeeds or not. A record that cannot be rebuilt is
+  // marked instead, because continuing to send from it is the failure this is
+  // here to end.
+  function reconcileRecord(o, carousel) {
+    o.reconciled = true;
+    var served = Array.prototype.map.call(carousel ? carousel.querySelectorAll('img') : [],
+      function (img) { return img.src || ''; }).filter(Boolean);
+    var index = o.index;
+    var path = o.path;
+    var gen = o.gen;
+    say('error', LOG_IMG, 'message #' + index + ' holds ' + o.thumbs.length
+      + ' attachments in this script\'s record against the ' + served.length
+      + ' the conversation shows; the record is being rebuilt from the server, and '
+      + 'the attachment it holds that the conversation does not have will be dropped '
+      + 'from it. Re-add that image if it is still wanted.');
+    listConversation('reconcileRecord', conversationId()).then(function (parsed) {
+      var byThumb = {};
+      (function walk(node) {
+        if (!Array.isArray(node)) return;
+        if (isAttTuple(node)) {
+          var key = thumbKey(node[3]);
+          if (key) byThumb[key] = node;
+          return;
+        }
+        node.forEach(walk);
+      })(parsed);
+      var tuples = served.map(function (src) { return byThumb[thumbKey(src)] || null; });
+      if (!served.length || tuples.indexOf(null) !== -1) {
+        markRecordUnsafe(index, path, 'its list disagrees with the conversation and the '
+          + 'server reports nothing for ' + (served.length ? 'every' : 'any')
+          + ' image the message is showing');
+        return;
+      }
+      var current = overrideAtPath(index, path);
+      // The same guard refreshOverride keeps, and for the same reason: a send
+      // that rewrote this record while the rpc was out owns what stands now,
+      // and this answer describes the turn as it was before that send.
+      if (!current || current.gen !== gen) {
+        dbg('reconcileRecord: message #' + index + ' was rewritten while the rebuild was in '
+          + 'flight (generation ' + gen + ' -> ' + (current ? current.gen : 'gone') + ')');
+        return;
+      }
+      current.attachments = tuples.map(function (t) {
+        return [[null, 1, 1, t[11]], t[2], t[5]];
+      });
+      releaseThumbs(current.thumbs, served);
+      current.thumbs = served.slice();
+      // The bytes were positional against the old list, and which of them
+      // belonged to which of these is no longer answerable. Dropping them costs
+      // a refetch per image on the next edit; keeping them risks uploading one
+      // image under another's name.
+      current.blobs = [];
+      current.gen = nextGen();
+      dropView(current);
+      persistOverrides(path);
+      say('error', LOG_IMG, 'message #' + index + ' rebuilt from the server: '
+        + tuples.length + ' attachments, and this message can be edited again');
+    }).catch(function (err) {
+      markRecordUnsafe(index, path, 'its list disagrees with the conversation and the '
+        + 'server could not be asked what the conversation holds (' + err + ')');
+    });
+  }
+
   // Runs on every mutation, because the carousel is Angular's and an inline style
   // put on it is only guaranteed to survive change detection, not a rebuild.
   function syncOverrides() {
@@ -1029,12 +1151,24 @@
       if (!drawable(o)) {
         dbg('syncOverrides: message #' + o.index + ' has a thumb with no source, '
           + 'leaving the carousel in place');
+        // A thumb with no source is only a hole to be filled later while the
+        // page holds an image for every entry. Once it does not, the record is
+        // describing a message the conversation does not have, and no later
+        // pass repairs that on its own.
+        var shown = carousel ? carousel.querySelectorAll('img').length : 0;
+        var verdict = shortfallVerdict(o, shown, Date.now());
+        if (verdict === 'reconcile') reconcileRecord(o, carousel);
+        else if (verdict === 'wait') armShortfallRecheck();
         // A takeover that began and then lost an image has already hidden it;
         // giving up without undoing that leaves the message showing nothing.
         if (carousel && carousel.style.display === 'none') carousel.style.display = '';
         dropView(o);
         continue;
       }
+      // Every entry can be drawn, so whatever shortfall was being timed is
+      // over. Left standing, its clock would expire against a later hole and
+      // rebuild a record that had recovered on its own.
+      o.shortAt = null;
       if (carousel && carousel.style.display !== 'none') carousel.style.display = 'none';
       if (!o.view || o.view.parentNode !== container) {
         dropView(o);
