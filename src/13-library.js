@@ -657,9 +657,23 @@
   // own counts. A console line is gone the moment the page is looked at from
   // outside it; this is readable at any time, by anyone, including a browser
   // being driven.
-  function noteDownload(text) {
+  //
+  // The same text also goes where the person who pressed the button can see
+  // it. This handler cancels the page's own download, so until it puts
+  // something on screen a click starts a run the page gives no sign of - a run
+  // measured at ten seconds when the held tokens have to be replaced.
+  function noteDownload(text, done) {
     var node = document.getElementById('gpie-style');
     if (node) node.setAttribute('data-download', text);
+    progress('download: ' + text, done);
+  }
+
+  // The button the click came from, marked for as long as the run lasts. The
+  // corner note says what is happening; this says it about the control the
+  // pointer is already on, and refuses a second click while the first runs.
+  function markBusy(button, busyNow) {
+    if (!button || !button.classList) return;
+    button.classList[busyNow ? 'add' : 'remove']('gpie-busy');
   }
 
 
@@ -695,6 +709,7 @@
 
     if (busy[target.id]) return;
     busy[target.id] = true;
+    markBusy(button, true);
     info('download: fetching the original of ' + target.id.slice(-8));
     noteDownload('asking for ' + target.id.slice(-8));
 
@@ -758,9 +773,9 @@
     // The reload is therefore the answer to a failure, not a precondition: the
     // held rows are tried first because they usually work, and the conversation
     // is asked for only once they have not.
-    function refreshed(tried) {
+    function refreshed(tried, why) {
       if (!conv) return Promise.reject(new Error('nothing names this image\'s conversation'));
-      noteDownload('the held tokens did not answer, reloading the conversation');
+      noteDownload(why);
       return loadConversation(conv).then(function (payload) {
         rememberOrigins(payload, 'a load made for this download');
         var late = tokensNow().filter(function (row) { return tried.indexOf(row.token) === -1; });
@@ -771,22 +786,51 @@
     }
 
     var held = tokensNow();
-    noteDownload(held.length + ' token(s) held, asking the download rpc');
-    tryInTurn(held, 0).catch(function (err) {
-      dbg('download: the held tokens did not reach the file (' + err.message + ')');
-      return refreshed(held.map(function (row) { return row.token; }));
-    }).then(function (blob) {
+    // What the rows look like on the way in. Which of the two figures picks the
+    // token the rpc answers for is unsettled - the ordering sorts on bytes and
+    // the note beside tokenForTurn measured it on length - and a run that
+    // prints both settles it without another instrumented session.
+    dbg('download: ' + held.length + ' row(s) held: ' + held.map(function (row) {
+      return (row.bytes || 0) + 'B/' + row.token.length + 'ch/slot' + row.slot
+        + '/' + (row.learnedAt ? Math.round((Date.now() - row.learnedAt) / 1000) + 's old'
+          : 'age unknown');
+    }).join(', '));
+
+    // A row past its life is not asked about. The read that replaces it costs
+    // 0.42s measured; the request it saves cost 8.7s and did not reach the file.
+    // See tokenIsFresh for the measurement and for why the library is where
+    // this decides anything.
+    var worthAsking = tokensAreFresh(held, Date.now());
+    var reached = (held.length && !worthAsking && conv)
+      ? refreshed([], 'the held tokens are past their life, reading the conversation first')
+        .catch(function (err) {
+          // The read is the better bet, not a guarantee. When it does not
+          // answer, what is held is still the only other thing there is.
+          dbg('download: the conversation did not answer (' + err.message
+            + '), the held tokens are tried after all');
+          noteDownload(held.length + ' token(s) held, asking the download rpc');
+          return tryInTurn(held, 0);
+        })
+      : (noteDownload(held.length + ' token(s) held, asking the download rpc'),
+        tryInTurn(held, 0).catch(function (err) {
+          dbg('download: the held tokens did not reach the file (' + err.message + ')');
+          return refreshed(held.map(function (row) { return row.token; }),
+            'the held tokens did not answer, reading the conversation');
+        }));
+
+    reached.then(function (blob) {
       noteDownload('fetched ' + blob.size + ' bytes, saving');
       saveBlob(blob, saveName(target.id, blob.type));
       info('download: saved the original from the download rpc, '
         + Math.round(blob.size / 1024) + ' KB');
-      noteDownload('saved ' + blob.size + ' bytes of ' + target.id.slice(-8));
+      noteDownload('saved ' + Math.round(blob.size / 1024) + ' KB', true);
     }).catch(function (err) {
       say('warn', LOG_IMG, 'download: the original could not be fetched (' + err.message
         + '); nothing was saved, and nothing else was tried');
-      noteDownload('failed: ' + err.message);
+      noteDownload('failed: ' + err.message, true);
     }).then(function () {
       delete busy[target.id];
+      markBusy(button, false);
     });
   }
 

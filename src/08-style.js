@@ -29,6 +29,18 @@
     'font:13px/1.5 system-ui,sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.4);',
     'pointer-events:none;white-space:pre-line}',
     '.gpie-progress.gpie-done{background:rgba(24,74,42,.94);border-color:rgba(52,168,83,.5)}',
+    // The page's own download button while §download holds it. The ring is
+    // drawn over the button rather than replacing its icon: the button is
+    // Gemini's and its contents are rebuilt freely, so nothing inside it is
+    // safe to edit, where a class on the element itself survives a rerender of
+    // what it contains. Pointer events go with it - a second click during the
+    // run is refused by §download anyway, and a control that swallows clicks
+    // without saying so is the thing this whole change exists to remove.
+    '.gpie-busy{position:relative;pointer-events:none}',
+    '.gpie-busy::after{content:"";position:absolute;top:50%;left:50%;',
+    'width:18px;height:18px;margin:-9px 0 0 -9px;border-radius:50%;',
+    'border:2px solid currentColor;border-top-color:transparent;opacity:.85;',
+    'animation:gpie-spin .7s linear infinite}',
     '.gpie-badge{position:absolute;top:4px;left:4px;background:rgba(0,0,0,.7);color:#fff;',
     'border-radius:6px;padding:0 5px;font-size:11px;line-height:16px;pointer-events:none}',
     '.gpie-state{position:absolute;left:4px;right:4px;bottom:4px;text-align:center;',
@@ -84,6 +96,34 @@
     '.gpie-usage-part{display:inline-block;white-space:nowrap;margin:0 14px}',
     '.gpie-usage-stale{opacity:.55}'
   ].join('');
+
+  // What the page can see of a run that would otherwise be silent. One node,
+  // reused: a caller reports into it while it works and leaves the outcome
+  // there. It lives here rather than with its first caller because two
+  // subsystems now report through it - §origins' sweep and §library's download
+  // - and the node it writes is styled by the sheet above.
+  //
+  // A console line is not a substitute. §download takes the page's own button
+  // and cancels its handler, so between the click and the file there is nothing
+  // on screen at all unless this says otherwise, and that stretch was measured
+  // at ten seconds.
+  var progressHide = 0;
+
+  function progress(text, done) {
+    var node = document.getElementById('gpie-progress');
+    if (!node) {
+      node = document.createElement('div');
+      node.id = 'gpie-progress';
+      node.className = 'gpie-progress';
+      (document.body || document.documentElement).appendChild(node);
+    }
+    node.className = 'gpie-progress' + (done ? ' gpie-done' : '');
+    node.textContent = text;
+    if (progressHide) clearTimeout(progressHide);
+    progressHide = done ? setTimeout(function () {
+      if (node.parentNode) node.parentNode.removeChild(node);
+    }, 8000) : 0;
+  }
 
   function injectStyle() {
     if (document.getElementById('gpie-style')) return;

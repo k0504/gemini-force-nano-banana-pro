@@ -114,27 +114,6 @@
     return answered + 'of' + (answered + pending);
   }
 
-  // What the page can see of a run that would otherwise be silent. One node,
-  // reused: a sweep reports into it while it works and leaves the outcome
-  // there, and a run started by hand is answered the moment it is asked for.
-  var progressHide = 0;
-
-  function progress(text, done) {
-    var node = document.getElementById('gpie-progress');
-    if (!node) {
-      node = document.createElement('div');
-      node.id = 'gpie-progress';
-      node.className = 'gpie-progress';
-      (document.body || document.documentElement).appendChild(node);
-    }
-    node.className = 'gpie-progress' + (done ? ' gpie-done' : '');
-    node.textContent = text;
-    if (progressHide) clearTimeout(progressHide);
-    progressHide = done ? setTimeout(function () {
-      if (node.parentNode) node.parentNode.removeChild(node);
-    }, 8000) : 0;
-  }
-
   function noteLedgerSize() {
     var node = document.getElementById('gpie-style');
     if (!node) return;
@@ -163,10 +142,50 @@
     return turnTokens[turnSlot(resp, slot)] || tokenByResp[resp] || null;
   }
 
+  // How long a held token is worth spending a request on.
+  //
+  // Measured 2026-09-02 on a library download: a row carried over from an
+  // earlier sweep was answered by the download rpc in 8.7s, and the key that
+  // answer named was then refused by the chain with http 400. The conversation
+  // read that mints a fresh row took 0.42s in the same run. So the held row is
+  // worth asking about only while it is young - being wrong about that costs
+  // one 0.42s read, being right saves ten seconds.
+  //
+  // The library is where this decides anything. Its rows come from a sweep
+  // that may have run days ago; a conversation page usually holds rows minted
+  // minutes earlier. The same code, the opposite odds, which is why the gamble
+  // looked sound for as long as it was only ever taken on a conversation page.
+  //
+  // The life the server actually grants is not known. This is set well short
+  // of any of it, because the two errors do not cost the same.
+  var TOKEN_TTL_MS = 30 * 60 * 1000;
+
+  // A row with no learning time was recorded before this was kept, and is not
+  // vouched for - the same reading §upload gives a contrib path whose mint it
+  // cannot produce.
+  function tokenIsFresh(row, now) {
+    return !!row && typeof row.learnedAt === 'number'
+      && (now - row.learnedAt) < TOKEN_TTL_MS;
+  }
+
+  // One fresh row is enough: the rows of a turn are read out of one answer, so
+  // they age together, and a list holding a young one is a list the last read
+  // produced.
+  function tokensAreFresh(rows, now) {
+    if (!rows || !rows.length) return false;
+    for (var i = 0; i < rows.length; i++) {
+      if (tokenIsFresh(rows[i], now)) return true;
+    }
+    return false;
+  }
+
   // Both indexes are written together, and the turn's index keeps the longest
   // token it has been shown.
   function holdToken(row) {
     if (!row || !row.token || !row.resp) return;
+    // When this row was learned, which is what tells a row worth spending a
+    // request on from one worth replacing outright. See tokenIsFresh.
+    row.learnedAt = Date.now();
     turnTokens[turnSlot(row.resp, row.slot)] = row;
     var best = tokenByResp[row.resp];
     if (!best || row.token.length > best.token.length) tokenByResp[row.resp] = row;
@@ -196,7 +215,18 @@
     for (var at in turnTokens) {
       if (at.indexOf(prefix) === 0) rows.push(turnTokens[at]);
     }
-    rows.sort(function (a, b) { return (b.bytes || 0) - (a.bytes || 0); });
+    rows.sort(function (a, b) {
+      var byBytes = (b.bytes || 0) - (a.bytes || 0);
+      if (byBytes) return byBytes;
+      // Where the byte counts agree, or are both absent, the longer token goes
+      // first: measured, the token that answers ran 281 characters where the
+      // one that answered nothing was shorter. This is a tiebreak and not the
+      // ordering, because which of the two predicts the answering token is not
+      // settled - a 2026-09-02 log shows the first row asked being refused with
+      // error 1003 both before and after a refresh, which the byte count did
+      // not foresee. §download prints both figures for the next run to say.
+      return b.token.length - a.token.length;
+    });
     return rows;
   }
 

@@ -3779,6 +3779,18 @@
     'font:13px/1.5 system-ui,sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.4);',
     'pointer-events:none;white-space:pre-line}',
     '.gpie-progress.gpie-done{background:rgba(24,74,42,.94);border-color:rgba(52,168,83,.5)}',
+    // The page's own download button while §download holds it. The ring is
+    // drawn over the button rather than replacing its icon: the button is
+    // Gemini's and its contents are rebuilt freely, so nothing inside it is
+    // safe to edit, where a class on the element itself survives a rerender of
+    // what it contains. Pointer events go with it - a second click during the
+    // run is refused by §download anyway, and a control that swallows clicks
+    // without saying so is the thing this whole change exists to remove.
+    '.gpie-busy{position:relative;pointer-events:none}',
+    '.gpie-busy::after{content:"";position:absolute;top:50%;left:50%;',
+    'width:18px;height:18px;margin:-9px 0 0 -9px;border-radius:50%;',
+    'border:2px solid currentColor;border-top-color:transparent;opacity:.85;',
+    'animation:gpie-spin .7s linear infinite}',
     '.gpie-badge{position:absolute;top:4px;left:4px;background:rgba(0,0,0,.7);color:#fff;',
     'border-radius:6px;padding:0 5px;font-size:11px;line-height:16px;pointer-events:none}',
     '.gpie-state{position:absolute;left:4px;right:4px;bottom:4px;text-align:center;',
@@ -3834,6 +3846,34 @@
     '.gpie-usage-part{display:inline-block;white-space:nowrap;margin:0 14px}',
     '.gpie-usage-stale{opacity:.55}'
   ].join('');
+
+  // What the page can see of a run that would otherwise be silent. One node,
+  // reused: a caller reports into it while it works and leaves the outcome
+  // there. It lives here rather than with its first caller because two
+  // subsystems now report through it - §origins' sweep and §library's download
+  // - and the node it writes is styled by the sheet above.
+  //
+  // A console line is not a substitute. §download takes the page's own button
+  // and cancels its handler, so between the click and the file there is nothing
+  // on screen at all unless this says otherwise, and that stretch was measured
+  // at ten seconds.
+  var progressHide = 0;
+
+  function progress(text, done) {
+    var node = document.getElementById('gpie-progress');
+    if (!node) {
+      node = document.createElement('div');
+      node.id = 'gpie-progress';
+      node.className = 'gpie-progress';
+      (document.body || document.documentElement).appendChild(node);
+    }
+    node.className = 'gpie-progress' + (done ? ' gpie-done' : '');
+    node.textContent = text;
+    if (progressHide) clearTimeout(progressHide);
+    progressHide = done ? setTimeout(function () {
+      if (node.parentNode) node.parentNode.removeChild(node);
+    }, 8000) : 0;
+  }
 
   function injectStyle() {
     if (document.getElementById('gpie-style')) return;
@@ -5654,9 +5694,23 @@
   // own counts. A console line is gone the moment the page is looked at from
   // outside it; this is readable at any time, by anyone, including a browser
   // being driven.
-  function noteDownload(text) {
+  //
+  // The same text also goes where the person who pressed the button can see
+  // it. This handler cancels the page's own download, so until it puts
+  // something on screen a click starts a run the page gives no sign of - a run
+  // measured at ten seconds when the held tokens have to be replaced.
+  function noteDownload(text, done) {
     var node = document.getElementById('gpie-style');
     if (node) node.setAttribute('data-download', text);
+    progress('download: ' + text, done);
+  }
+
+  // The button the click came from, marked for as long as the run lasts. The
+  // corner note says what is happening; this says it about the control the
+  // pointer is already on, and refuses a second click while the first runs.
+  function markBusy(button, busyNow) {
+    if (!button || !button.classList) return;
+    button.classList[busyNow ? 'add' : 'remove']('gpie-busy');
   }
 
 
@@ -5692,6 +5746,7 @@
 
     if (busy[target.id]) return;
     busy[target.id] = true;
+    markBusy(button, true);
     info('download: fetching the original of ' + target.id.slice(-8));
     noteDownload('asking for ' + target.id.slice(-8));
 
@@ -5755,9 +5810,9 @@
     // The reload is therefore the answer to a failure, not a precondition: the
     // held rows are tried first because they usually work, and the conversation
     // is asked for only once they have not.
-    function refreshed(tried) {
+    function refreshed(tried, why) {
       if (!conv) return Promise.reject(new Error('nothing names this image\'s conversation'));
-      noteDownload('the held tokens did not answer, reloading the conversation');
+      noteDownload(why);
       return loadConversation(conv).then(function (payload) {
         rememberOrigins(payload, 'a load made for this download');
         var late = tokensNow().filter(function (row) { return tried.indexOf(row.token) === -1; });
@@ -5768,22 +5823,51 @@
     }
 
     var held = tokensNow();
-    noteDownload(held.length + ' token(s) held, asking the download rpc');
-    tryInTurn(held, 0).catch(function (err) {
-      dbg('download: the held tokens did not reach the file (' + err.message + ')');
-      return refreshed(held.map(function (row) { return row.token; }));
-    }).then(function (blob) {
+    // What the rows look like on the way in. Which of the two figures picks the
+    // token the rpc answers for is unsettled - the ordering sorts on bytes and
+    // the note beside tokenForTurn measured it on length - and a run that
+    // prints both settles it without another instrumented session.
+    dbg('download: ' + held.length + ' row(s) held: ' + held.map(function (row) {
+      return (row.bytes || 0) + 'B/' + row.token.length + 'ch/slot' + row.slot
+        + '/' + (row.learnedAt ? Math.round((Date.now() - row.learnedAt) / 1000) + 's old'
+          : 'age unknown');
+    }).join(', '));
+
+    // A row past its life is not asked about. The read that replaces it costs
+    // 0.42s measured; the request it saves cost 8.7s and did not reach the file.
+    // See tokenIsFresh for the measurement and for why the library is where
+    // this decides anything.
+    var worthAsking = tokensAreFresh(held, Date.now());
+    var reached = (held.length && !worthAsking && conv)
+      ? refreshed([], 'the held tokens are past their life, reading the conversation first')
+        .catch(function (err) {
+          // The read is the better bet, not a guarantee. When it does not
+          // answer, what is held is still the only other thing there is.
+          dbg('download: the conversation did not answer (' + err.message
+            + '), the held tokens are tried after all');
+          noteDownload(held.length + ' token(s) held, asking the download rpc');
+          return tryInTurn(held, 0);
+        })
+      : (noteDownload(held.length + ' token(s) held, asking the download rpc'),
+        tryInTurn(held, 0).catch(function (err) {
+          dbg('download: the held tokens did not reach the file (' + err.message + ')');
+          return refreshed(held.map(function (row) { return row.token; }),
+            'the held tokens did not answer, reading the conversation');
+        }));
+
+    reached.then(function (blob) {
       noteDownload('fetched ' + blob.size + ' bytes, saving');
       saveBlob(blob, saveName(target.id, blob.type));
       info('download: saved the original from the download rpc, '
         + Math.round(blob.size / 1024) + ' KB');
-      noteDownload('saved ' + blob.size + ' bytes of ' + target.id.slice(-8));
+      noteDownload('saved ' + Math.round(blob.size / 1024) + ' KB', true);
     }).catch(function (err) {
       say('warn', LOG_IMG, 'download: the original could not be fetched (' + err.message
         + '); nothing was saved, and nothing else was tried');
-      noteDownload('failed: ' + err.message);
+      noteDownload('failed: ' + err.message, true);
     }).then(function () {
       delete busy[target.id];
+      markBusy(button, false);
     });
   }
 
@@ -5990,27 +6074,6 @@
     return answered + 'of' + (answered + pending);
   }
 
-  // What the page can see of a run that would otherwise be silent. One node,
-  // reused: a sweep reports into it while it works and leaves the outcome
-  // there, and a run started by hand is answered the moment it is asked for.
-  var progressHide = 0;
-
-  function progress(text, done) {
-    var node = document.getElementById('gpie-progress');
-    if (!node) {
-      node = document.createElement('div');
-      node.id = 'gpie-progress';
-      node.className = 'gpie-progress';
-      (document.body || document.documentElement).appendChild(node);
-    }
-    node.className = 'gpie-progress' + (done ? ' gpie-done' : '');
-    node.textContent = text;
-    if (progressHide) clearTimeout(progressHide);
-    progressHide = done ? setTimeout(function () {
-      if (node.parentNode) node.parentNode.removeChild(node);
-    }, 8000) : 0;
-  }
-
   function noteLedgerSize() {
     var node = document.getElementById('gpie-style');
     if (!node) return;
@@ -6039,10 +6102,50 @@
     return turnTokens[turnSlot(resp, slot)] || tokenByResp[resp] || null;
   }
 
+  // How long a held token is worth spending a request on.
+  //
+  // Measured 2026-09-02 on a library download: a row carried over from an
+  // earlier sweep was answered by the download rpc in 8.7s, and the key that
+  // answer named was then refused by the chain with http 400. The conversation
+  // read that mints a fresh row took 0.42s in the same run. So the held row is
+  // worth asking about only while it is young - being wrong about that costs
+  // one 0.42s read, being right saves ten seconds.
+  //
+  // The library is where this decides anything. Its rows come from a sweep
+  // that may have run days ago; a conversation page usually holds rows minted
+  // minutes earlier. The same code, the opposite odds, which is why the gamble
+  // looked sound for as long as it was only ever taken on a conversation page.
+  //
+  // The life the server actually grants is not known. This is set well short
+  // of any of it, because the two errors do not cost the same.
+  var TOKEN_TTL_MS = 30 * 60 * 1000;
+
+  // A row with no learning time was recorded before this was kept, and is not
+  // vouched for - the same reading §upload gives a contrib path whose mint it
+  // cannot produce.
+  function tokenIsFresh(row, now) {
+    return !!row && typeof row.learnedAt === 'number'
+      && (now - row.learnedAt) < TOKEN_TTL_MS;
+  }
+
+  // One fresh row is enough: the rows of a turn are read out of one answer, so
+  // they age together, and a list holding a young one is a list the last read
+  // produced.
+  function tokensAreFresh(rows, now) {
+    if (!rows || !rows.length) return false;
+    for (var i = 0; i < rows.length; i++) {
+      if (tokenIsFresh(rows[i], now)) return true;
+    }
+    return false;
+  }
+
   // Both indexes are written together, and the turn's index keeps the longest
   // token it has been shown.
   function holdToken(row) {
     if (!row || !row.token || !row.resp) return;
+    // When this row was learned, which is what tells a row worth spending a
+    // request on from one worth replacing outright. See tokenIsFresh.
+    row.learnedAt = Date.now();
     turnTokens[turnSlot(row.resp, row.slot)] = row;
     var best = tokenByResp[row.resp];
     if (!best || row.token.length > best.token.length) tokenByResp[row.resp] = row;
@@ -6072,7 +6175,18 @@
     for (var at in turnTokens) {
       if (at.indexOf(prefix) === 0) rows.push(turnTokens[at]);
     }
-    rows.sort(function (a, b) { return (b.bytes || 0) - (a.bytes || 0); });
+    rows.sort(function (a, b) {
+      var byBytes = (b.bytes || 0) - (a.bytes || 0);
+      if (byBytes) return byBytes;
+      // Where the byte counts agree, or are both absent, the longer token goes
+      // first: measured, the token that answers ran 281 characters where the
+      // one that answered nothing was shorter. This is a tiebreak and not the
+      // ordering, because which of the two predicts the answering token is not
+      // settled - a 2026-09-02 log shows the first row asked being refused with
+      // error 1003 both before and after a refresh, which the byte count did
+      // not foresee. §download prints both figures for the next run to say.
+      return b.token.length - a.token.length;
+    });
     return rows;
   }
 
