@@ -84,12 +84,13 @@
   //
   // Attachments come in two shapes and may be mixed inside one array:
   //   form A (already on the message)  [[null,1,1,mime], name, "<long token>"]
-  //   form B (uploaded this document)  [[contribPath,1,null,mime,uuid], name,
-  //                                     null,null,null,null,null,null,[0]]
+  //   form B (uploaded this document)  [[contribPath,1,null,mime], name]
   //
-  // A brand-new upload send carries form B in two elements, without that tail.
-  // The tail belongs to an edit resend, and the two must not be mixed: see
-  // §shape for what the server charges for each difference.
+  // Form B once carried a uuid as a fifth meta element and a nine-element tail
+  // ending in [0]. The tail belongs to an edit resend and was never ours to
+  // send; the uuid stopped existing when ProcessFile was retired. See §upload.
+  // The two forms must not be mixed: see §shape for what the server charges for
+  // each difference.
   //
   // Both features rewrite the same request, so the body is parsed and
   // serialised once and each feature edits the shared inner array in place.
@@ -114,7 +115,6 @@
   var PRO_MARKER = [null, null, null, null, null, null, [null, [1]]];
 
   var UPLOAD_ENDPOINT = 'https://push.clients6.google.com/upload/';
-  var PROCESS_FILE_PATH = '/_/BardChatUi/data/assistant.lamda.BardFrontendService/ProcessFile';
   var BATCH_EXECUTE_PATH = '/_/BardChatUi/data/batchexecute';
   var LIST_CONVERSATION_RPC = 'hNvQHb';
 
@@ -645,7 +645,10 @@
   // a length-prefixed stream of envelopes whose payload is a JSON document
   // escaped into a JSON string. What differs is the address: batchexecute
   // names its rpc in the query and echoes that name back in the envelope,
-  // while a dedicated path such as ProcessFile carries a null in that slot.
+  // while a dedicated path carries a null in that slot. Every caller left goes
+  // through batchexecute; the null-name reading is kept because ProcessFile,
+  // the dedicated path this script used to call, was read that way until the
+  // server retired it, and the next one will be read the same way.
   //
   // The payload is passed as a value and serialised here. The wire format
   // nests it as a string inside another JSON document, and doing that at each
@@ -2244,10 +2247,19 @@
   }
 
   // §upload ==================================================================
-  // Three steps, then the result is referenced as a form B attachment.
+  // Two steps, then the result is referenced as a form B attachment.
   //   1. start a resumable upload, the response header carries the upload URL
   //   2. push the bytes, the response body is the contrib_service path
-  //   3. ProcessFile exchanges that path for the uuid the prompt tuple needs
+  //
+  // There was a third step. ProcessFile exchanged the contrib path for a uuid,
+  // and that uuid went out as a fifth element of the attachment meta. On
+  // 2026-09-02 the server stopped answering one: ProcessFile still returns 200,
+  // but the payload is a file metadata record - a download URL and a long-lived
+  // token - with no uuid in it at any index, and the step failed on reading the
+  // one it used to hold. A capture of what the page itself sends settled what
+  // replaces it: no ProcessFile call is made at all, and the meta is four
+  // elements ending at the mime type. The contrib path from step 2 is the whole
+  // of the reference now.
   //
   // Contrib paths minted here are noted, because one read back out of the
   // record was minted by an earlier document and carries that document's
@@ -2313,7 +2325,6 @@
       + (sniffed['push-id'] ? 'sniffed' : 'wiz') + ')');
     var doneStep1 = dbgT('upload step 1');
     var doneStep2 = null;
-    var doneStep3 = null;
     noteUploadStart();
     return fetch(UPLOAD_ENDPOINT, {
       method: 'POST',
@@ -2339,33 +2350,13 @@
       return res.text();
     }).then(function (text) {
       var contrib = String(text).trim();
-      doneStep2('contrib', contrib.slice(0, 50) + '...');
       if (contrib.indexOf(CONTRIB_PREFIX) !== 0) throw new Error('upload returned no contrib path');
-      doneStep3 = dbgT('upload step 3');
-      return processFile(contrib, file.name, mime).then(function (uuid) {
-        doneStep3('uuid', uuid, '-> form B tuple ready');
-        noteUploadEnd();
-        contribsThisDocument[contrib] = Date.now();
-        // Nine elements with the [0] tail, which is what an edit resend
-        // carries. §apply trims it to two for a send that takes the brand-new
-        // upload shape.
-        return [[contrib, 1, null, mime, uuid], file.name,
-          null, null, null, null, null, null, [0]];
-      });
-    });
-  }
-
-  function processFile(contrib, name, mime) {
-    var hl = locale();
-    var inner = JSON.stringify([[[contrib, null, 1, mime], name], null, 1, [hl]]);
-    // A dedicated path rather than batchexecute: the rpc is named by the
-    // address, so the envelope it answers in carries a null where a
-    // batchexecute answer would name it.
-    return rpcPost(PROCESS_FILE_PATH + '?' + rpcQuery(),
-      JSON.stringify([null, inner]), null, 'ProcessFile').then(function (parsed) {
-      var uuid = parsed && parsed[3] && parsed[3][0];
-      if (!uuid) throw new Error('ProcessFile returned no uuid');
-      return uuid;
+      doneStep2('contrib', contrib.slice(0, 50) + '...', '-> form B tuple ready');
+      noteUploadEnd();
+      contribsThisDocument[contrib] = Date.now();
+      // Two elements, the shape a capture of the page's own send shows. §apply
+      // writes exactly these two, so nothing downstream reads past them.
+      return [[contrib, 1, null, mime], file.name];
     });
   }
 

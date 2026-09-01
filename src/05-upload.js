@@ -1,8 +1,17 @@
   // §upload ==================================================================
-  // Three steps, then the result is referenced as a form B attachment.
+  // Two steps, then the result is referenced as a form B attachment.
   //   1. start a resumable upload, the response header carries the upload URL
   //   2. push the bytes, the response body is the contrib_service path
-  //   3. ProcessFile exchanges that path for the uuid the prompt tuple needs
+  //
+  // There was a third step. ProcessFile exchanged the contrib path for a uuid,
+  // and that uuid went out as a fifth element of the attachment meta. On
+  // 2026-09-02 the server stopped answering one: ProcessFile still returns 200,
+  // but the payload is a file metadata record - a download URL and a long-lived
+  // token - with no uuid in it at any index, and the step failed on reading the
+  // one it used to hold. A capture of what the page itself sends settled what
+  // replaces it: no ProcessFile call is made at all, and the meta is four
+  // elements ending at the mime type. The contrib path from step 2 is the whole
+  // of the reference now.
   //
   // Contrib paths minted here are noted, because one read back out of the
   // record was minted by an earlier document and carries that document's
@@ -68,7 +77,6 @@
       + (sniffed['push-id'] ? 'sniffed' : 'wiz') + ')');
     var doneStep1 = dbgT('upload step 1');
     var doneStep2 = null;
-    var doneStep3 = null;
     noteUploadStart();
     return fetch(UPLOAD_ENDPOINT, {
       method: 'POST',
@@ -94,33 +102,13 @@
       return res.text();
     }).then(function (text) {
       var contrib = String(text).trim();
-      doneStep2('contrib', contrib.slice(0, 50) + '...');
       if (contrib.indexOf(CONTRIB_PREFIX) !== 0) throw new Error('upload returned no contrib path');
-      doneStep3 = dbgT('upload step 3');
-      return processFile(contrib, file.name, mime).then(function (uuid) {
-        doneStep3('uuid', uuid, '-> form B tuple ready');
-        noteUploadEnd();
-        contribsThisDocument[contrib] = Date.now();
-        // Nine elements with the [0] tail, which is what an edit resend
-        // carries. §apply trims it to two for a send that takes the brand-new
-        // upload shape.
-        return [[contrib, 1, null, mime, uuid], file.name,
-          null, null, null, null, null, null, [0]];
-      });
-    });
-  }
-
-  function processFile(contrib, name, mime) {
-    var hl = locale();
-    var inner = JSON.stringify([[[contrib, null, 1, mime], name], null, 1, [hl]]);
-    // A dedicated path rather than batchexecute: the rpc is named by the
-    // address, so the envelope it answers in carries a null where a
-    // batchexecute answer would name it.
-    return rpcPost(PROCESS_FILE_PATH + '?' + rpcQuery(),
-      JSON.stringify([null, inner]), null, 'ProcessFile').then(function (parsed) {
-      var uuid = parsed && parsed[3] && parsed[3][0];
-      if (!uuid) throw new Error('ProcessFile returned no uuid');
-      return uuid;
+      doneStep2('contrib', contrib.slice(0, 50) + '...', '-> form B tuple ready');
+      noteUploadEnd();
+      contribsThisDocument[contrib] = Date.now();
+      // Two elements, the shape a capture of the page's own send shows. §apply
+      // writes exactly these two, so nothing downstream reads past them.
+      return [[contrib, 1, null, mime], file.name];
     });
   }
 

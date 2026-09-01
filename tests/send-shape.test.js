@@ -62,7 +62,7 @@ const api = new Function('PROMPT_TUPLE', 'ATTACHMENTS', 'ACTION_INDEX', 'ACTION_
 const CONV = 'c_00112233445566778899aabbccddeeff';
 
 function contrib(name) {
-  return [['/contrib_service/ttl_1d/' + name, 1, null, 'image/jpeg', 'uuid-' + name], name];
+  return [['/contrib_service/ttl_1d/' + name, 1, null, 'image/jpeg'], name];
 }
 
 function token(name) {

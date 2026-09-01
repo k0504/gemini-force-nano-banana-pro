@@ -15,12 +15,13 @@
   //
   // Attachments come in two shapes and may be mixed inside one array:
   //   form A (already on the message)  [[null,1,1,mime], name, "<long token>"]
-  //   form B (uploaded this document)  [[contribPath,1,null,mime,uuid], name,
-  //                                     null,null,null,null,null,null,[0]]
+  //   form B (uploaded this document)  [[contribPath,1,null,mime], name]
   //
-  // A brand-new upload send carries form B in two elements, without that tail.
-  // The tail belongs to an edit resend, and the two must not be mixed: see
-  // §shape for what the server charges for each difference.
+  // Form B once carried a uuid as a fifth meta element and a nine-element tail
+  // ending in [0]. The tail belongs to an edit resend and was never ours to
+  // send; the uuid stopped existing when ProcessFile was retired. See §upload.
+  // The two forms must not be mixed: see §shape for what the server charges for
+  // each difference.
   //
   // Both features rewrite the same request, so the body is parsed and
   // serialised once and each feature edits the shared inner array in place.
@@ -45,7 +46,6 @@
   var PRO_MARKER = [null, null, null, null, null, null, [null, [1]]];
 
   var UPLOAD_ENDPOINT = 'https://push.clients6.google.com/upload/';
-  var PROCESS_FILE_PATH = '/_/BardChatUi/data/assistant.lamda.BardFrontendService/ProcessFile';
   var BATCH_EXECUTE_PATH = '/_/BardChatUi/data/batchexecute';
   var LIST_CONVERSATION_RPC = 'hNvQHb';
 
@@ -576,7 +576,10 @@
   // a length-prefixed stream of envelopes whose payload is a JSON document
   // escaped into a JSON string. What differs is the address: batchexecute
   // names its rpc in the query and echoes that name back in the envelope,
-  // while a dedicated path such as ProcessFile carries a null in that slot.
+  // while a dedicated path carries a null in that slot. Every caller left goes
+  // through batchexecute; the null-name reading is kept because ProcessFile,
+  // the dedicated path this script used to call, was read that way until the
+  // server retired it, and the next one will be read the same way.
   //
   // The payload is passed as a value and serialised here. The wire format
   // nests it as a string inside another JSON document, and doing that at each

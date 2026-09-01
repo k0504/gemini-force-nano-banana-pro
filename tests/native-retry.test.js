@@ -76,7 +76,7 @@ function token(name) {
 }
 
 function contrib(name) {
-  return [['/contrib_service/ttl_1d/' + name, 1, null, 'image/jpeg', 'uuid-' + name], name];
+  return [['/contrib_service/ttl_1d/' + name, 1, null, 'image/jpeg'], name];
 }
 
 // A StreamGenerate inner array of the length a capture shows, carrying one
